@@ -1,0 +1,9 @@
+/lib/deps/
+/releases/
+/bin/
+*.zip
+.DS_Store
+.idea/
+.settings/
+.classpath
+.project

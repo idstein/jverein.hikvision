@@ -1,0 +1,127 @@
+<?xml version="1.0" encoding="UTF-8"?>
+
+<project basedir=".." default="all" name="jverein.hikvision">
+	<property name="build.dir" value="build" />
+
+	<target name="init" description="inits the build">
+		<property environment="env" />
+		<buildnumber file="${build.dir}/BUILD" />
+		<xmlproperty file="plugin.xml" collapseattributes="true" />
+		<loadproperties srcFile="${build.dir}/build.properties" />
+
+		<echo message="VERSION: ${plugin.version}" />
+		<echo message="BUILD  : ${build.number}" />
+		<echo message="JAVA   : ${java.version}" />
+
+		<property name="define.jarfilename" value="${plugin.name}.jar" />
+		<property name="define.zipfilename" value="${plugin.name}.zip" />
+
+		<property name="project.nightly" value="releases/nightly" />
+		<property name="project.release" value="releases/${plugin.version}-${build.number}" />
+		<property name="project.tmp" value="${project.release}/tmp" />
+		<property name="project.zipdir" value="${project.release}/${plugin.name}" />
+
+		<property name="src.dir" value="src" />
+		<property name="class.dir" value="${project.tmp}/bin" />
+		<property name="deps.dir" value="lib/deps" />
+
+		<!-- Compile against prebuilt jameica 2.12.0 + jverein 4.1.5 jars
+		     dropped into lib/deps/ (see build-dependencies target). -->
+		<path id="compilepath">
+			<pathelement location="${deps.dir}/jameica/jameica.jar" />
+			<fileset dir="${deps.dir}/jameica/lib">
+				<include name="**/*.jar" />
+				<exclude name="swt/linux/**" />
+				<exclude name="swt/linux-arm64/**" />
+				<exclude name="swt/macos*/**" />
+				<exclude name="swt/win32/**" />
+				<exclude name="swt/win64/**" />
+			</fileset>
+			<pathelement location="${deps.dir}/jverein/jverein.jar" />
+			<fileset dir="${deps.dir}/jverein/lib">
+				<include name="**/*.jar" />
+			</fileset>
+			<!-- bundled runtime jars (org.json etc.) — also shipped in the plugin zip -->
+			<fileset dir="lib">
+				<include name="*.jar" />
+			</fileset>
+		</path>
+	</target>
+
+	<target depends="init" name="compile" description="compiles everything">
+		<mkdir dir="${class.dir}" />
+		<javac debug="true" includeantruntime="false" debuglevel="lines,vars,source"
+		       deprecation="true" source="${define.java.version}" target="${define.java.version}"
+		       encoding="${define.encoding}" srcdir="${src.dir}" destdir="${class.dir}">
+			<classpath refid="compilepath" />
+		</javac>
+	</target>
+
+	<target depends="compile" name="jar" description="generates the jar file">
+		<mkdir dir="${project.release}" />
+		<mkdir dir="${project.zipdir}" />
+		<tstamp />
+		<jar destfile="${project.zipdir}/${define.jarfilename}">
+			<manifest>
+				<attribute name="Built-By" value="${user.name}" />
+				<attribute name="Built-Date" value="${DSTAMP}" />
+				<attribute name="Implementation-Title" value="${plugin.name}" />
+				<attribute name="Implementation-Version" value="${plugin.version}" />
+				<attribute name="Implementation-Buildnumber" value="${build.number}" />
+			</manifest>
+			<fileset dir="${class.dir}" />
+		</jar>
+		<copy file="plugin.xml" todir="${project.zipdir}" />
+		<copy file="${build.dir}/COPYING" todir="${project.zipdir}" />
+		<!-- bundle runtime jars (org.json) into the plugin's lib/ -->
+		<mkdir dir="${project.zipdir}/lib" />
+		<copy todir="${project.zipdir}/lib">
+			<fileset dir="lib">
+				<include name="*.jar" />
+			</fileset>
+		</copy>
+		<zip destfile="${project.release}/${define.zipfilename}">
+			<fileset dir="${project.release}">
+				<include name="${plugin.name}" />
+				<include name="${plugin.name}/**" />
+			</fileset>
+		</zip>
+	</target>
+
+	<target name="clean" description="cleanup">
+		<delete dir="${project.tmp}" />
+		<delete dir="${project.zipdir}" />
+		<delete dir="${class.dir}" />
+	</target>
+
+	<target depends="init,compile,jar,clean" description="build" name="all" />
+
+	<target depends="init,compile,jar" description="nightly build" name="nightly">
+		<mkdir dir="${project.nightly}" />
+		<copy file="${project.release}/${define.zipfilename}"
+		      tofile="${project.nightly}/${plugin.name}-${plugin.version}-nightly.zip" />
+		<delete dir="${project.release}" />
+		<echo message="SELECTED_VERSION=${plugin.version}-nightly" />
+		<echo message="SELECTED_FILENAME=${plugin.name}-${plugin.version}-nightly.zip" />
+	</target>
+
+	<!-- Downloads prebuilt jameica + jverein release archives into lib/deps/.
+	     Only needed once (or when bumping target versions in build.properties). -->
+	<target name="build-dependencies" description="Downloads prebuilt Jameica + JVerein archives" depends="init">
+		<mkdir dir="${deps.dir}" />
+		<antcall target="fetch-jameica" />
+		<antcall target="fetch-jverein" />
+	</target>
+
+	<target name="fetch-jameica">
+		<get src="${jameica.archive.url}" dest="${deps.dir}/jameica.zip" skipexisting="true" />
+		<delete dir="${deps.dir}/jameica" />
+		<unzip src="${deps.dir}/jameica.zip" dest="${deps.dir}" />
+	</target>
+
+	<target name="fetch-jverein">
+		<get src="${jverein.archive.url}" dest="${deps.dir}/jverein.zip" skipexisting="true" />
+		<delete dir="${deps.dir}/jverein" />
+		<unzip src="${deps.dir}/jverein.zip" dest="${deps.dir}" />
+	</target>
+</project>

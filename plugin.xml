@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+
+<plugin xmlns="http://www.willuhn.de/schema/jameica-plugin"
+        xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+        xsi:schemaLocation="http://www.willuhn.de/schema/jameica-plugin http://www.willuhn.de/schema/jameica-plugin-1.5.xsd"
+        name="jverein.hikvision" version="0.1.0" class="de.jost_net.JVerein.hikvision.Plugin">
+
+  <description>Synchronisiert jVerein-Mitglieder mit Hikvision Zutrittssystem (DS-K2702WX und ähnlich) via ISAPI</description>
+  <url>https://github.com/idstein/jverein.hikvision</url>
+  <homepage validate="true">https://github.com/idstein/jverein.hikvision</homepage>
+  <license>GPL - http://www.gnu.org/copyleft/gpl.html</license>
+
+  <requires jameica="2.10.0+">
+    <import plugin="jverein" version="3.1.0+"/>
+  </requires>
+
+  <classfinder>
+    <include>jverein\.hikvision\.jar</include>
+    <include>json.*\.jar</include>
+    <include>.*\.class</include>
+  </classfinder>
+
+  <extensions>
+    <extension class="de.jost_net.JVerein.hikvision.ext.SettingsView"
+               extends="de.willuhn.jameica.gui.internal.views.Settings"/>
+  </extensions>
+
+</plugin>
