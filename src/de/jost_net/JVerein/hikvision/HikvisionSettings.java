@@ -41,15 +41,6 @@ public class HikvisionSettings
     catch (Exception e) { Logger.error("unable to write controller password to wallet", e); }
   }
 
-  // -- CSV lookup --
-  public static String getCsvPath()
-  {
-    return SETTINGS.getString("csv.path",
-        Application.getPluginLoader().getPlugin(Plugin.class).getResources().getWorkPath()
-            + "/chip_kartennummer.csv");
-  }
-  public static void setCsvPath(String s) { SETTINGS.setAttribute("csv.path", s); }
-
   // -- Hikvision group / type mapping --
   public static String getMemberGroupId()
   {

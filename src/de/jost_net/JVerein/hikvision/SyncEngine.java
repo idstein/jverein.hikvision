@@ -74,9 +74,9 @@ public class SyncEngine
   }
 
   /**
-   * Build desired state from jverein + CSV. Returns map: employeeNo -> Desired.
+   * Build desired state from jverein + ChipStore. Returns map: employeeNo -> Desired.
    */
-  public static Map<String, Desired> buildDesired(CsvLookup csv, String zusatzfeldName,
+  public static Map<String, Desired> buildDesired(ChipStore chips, String zusatzfeldName,
                                                   ProgressListener pl, Result r) throws Exception
   {
     // Pre-resolve the Felddefinition for the transponder zusatzfeld
@@ -110,12 +110,12 @@ public class SyncEngine
       {
         String c = chip.trim();
         if (c.isEmpty()) continue;
-        String cardNo = csv.cardForChip(c);
+        String cardNo = chips.cardForChip(c);
         if (cardNo == null)
         {
           r.unknownCards++;
           pl.log("WARN: chip '" + c + "' (jv_id=" + m.getID() + " " + m.getVorname() + " " + m.getName()
-              + ") nicht in CSV — übersprungen");
+              + ") nicht in ChipStore — übersprungen");
           continue;
         }
         cardNos.add(cardNo);
@@ -179,14 +179,14 @@ public class SyncEngine
 
     pl.log("=== Sync " + (dryRun ? "(DRY-RUN)" : "(APPLY)") + " ===");
 
-    CsvLookup csv = new CsvLookup(HikvisionSettings.getCsvPath());
-    pl.log("CSV geladen: " + csv.size() + " Chip↔Kartennummer-Einträge (" + HikvisionSettings.getCsvPath() + ")");
+    ChipStore chips = ChipStore.defaultStore();
+    pl.log("ChipStore: " + chips.size() + " Chip↔Kartennummer-Einträge geladen");
 
     HikvisionClient client = new HikvisionClient(
         HikvisionSettings.getControllerUrl(), HikvisionSettings.getControllerUser(),
         HikvisionSettings.getControllerPassword(), HikvisionSettings.getInterCallPauseMs());
 
-    Map<String, Desired> desired = buildDesired(csv, HikvisionSettings.getZusatzfeldName(), pl, r);
+    Map<String, Desired> desired = buildDesired(chips, HikvisionSettings.getZusatzfeldName(), pl, r);
     Map<String, Actual>  actual  = buildActual(client, pl);
 
     // Compute diff
@@ -276,5 +276,163 @@ public class SyncEngine
       for (String e : r.errors) Logger.warn("sync error: " + e);
     }
     return r;
+  }
+
+  // =====================================================================
+  // Reverse-import: Hikvision → jverein (used for bootstrap)
+  // =====================================================================
+
+  public static class ImportResult
+  {
+    public int membersUpdated;
+    public int membersUnchanged;
+    public int hikvisionUsersUnmatched;
+    public int unknownCards;
+    public boolean dryRun;
+    public final List<String> errors = new ArrayList<>();
+  }
+
+  /**
+   * Pulls Hikvision UserInfo + CardInfo and writes the chip list (joined
+   * with ChipStore) into each matched jverein member's transponder
+   * zusatzfeld. Only managed employeeNos (int-parseable or G-prefix) are
+   * considered.
+   *
+   * INTENDED for one-time bootstrap. In steady-state jverein is the source
+   * of truth and the regular {@link #run} sync (jverein → Hikvision) is
+   * what you want.
+   */
+  public static ImportResult importFromHikvision(boolean dryRun, ProgressListener pl) throws Exception
+  {
+    ImportResult r = new ImportResult();
+    r.dryRun = dryRun;
+
+    pl.log("=== Import " + (dryRun ? "(DRY-RUN)" : "(APPLY)") + " ===");
+
+    ChipStore chips = ChipStore.defaultStore();
+    pl.log("ChipStore: " + chips.size() + " Chip↔Kartennummer-Einträge geladen");
+
+    HikvisionClient client = new HikvisionClient(
+        HikvisionSettings.getControllerUrl(), HikvisionSettings.getControllerUser(),
+        HikvisionSettings.getControllerPassword(), HikvisionSettings.getInterCallPauseMs());
+
+    pl.log("Hikvision UserInfo abrufen…");
+    JSONArray users = client.listAllUsers();
+    pl.log("Hikvision CardInfo abrufen…");
+    JSONArray cards = client.listAllCards();
+
+    // group cards by employeeNo
+    Map<String, List<String>> cardsByEmp = new HashMap<>();
+    for (int i = 0; i < cards.length(); i++)
+    {
+      JSONObject c = cards.getJSONObject(i);
+      String emp = c.optString("employeeNo");
+      cardsByEmp.computeIfAbsent(emp, k -> new ArrayList<>()).add(c.optString("cardNo"));
+    }
+
+    // index jverein members by externe (int-normalized) and by jv_id (for G-prefix)
+    Map<String, Mitglied> byExterne = new HashMap<>();
+    Map<String, Mitglied> byId = new HashMap<>();
+    DBIterator<Mitglied> it = Einstellungen.getDBService().createList(Mitglied.class);
+    while (it.hasNext())
+    {
+      Mitglied m = (Mitglied) it.next();
+      byId.put(m.getID(), m);
+      String ext = m.getExterneMitgliedsnummer();
+      if (ext != null && !ext.trim().isEmpty())
+      {
+        try { byExterne.put(String.valueOf(Integer.parseInt(ext.trim())), m); }
+        catch (NumberFormatException ignore) { byExterne.put(ext.trim(), m); }
+      }
+    }
+
+    // pre-resolve the Felddefinition
+    DBIterator<Felddefinition> defs = Einstellungen.getDBService().createList(Felddefinition.class);
+    defs.addFilter("name = ?", HikvisionSettings.getZusatzfeldName());
+    if (!defs.hasNext())
+      throw new IllegalStateException("Felddefinition '" + HikvisionSettings.getZusatzfeldName() + "' nicht gefunden in jverein");
+    Felddefinition transponderDef = (Felddefinition) defs.next();
+    String transponderDefId = transponderDef.getID();
+
+    int total = users.length(), done = 0;
+    for (int i = 0; i < users.length(); i++)
+    {
+      JSONObject u = users.getJSONObject(i);
+      String emp = u.optString("employeeNo");
+      done++; pl.progress(done, total);
+
+      if (!Identity.isManaged(emp)) continue;
+
+      Mitglied member;
+      if (emp.startsWith("G")) member = byId.get(emp.substring(1));
+      else
+      {
+        try { member = byExterne.get(String.valueOf(Integer.parseInt(emp))); }
+        catch (NumberFormatException nfe) { member = byExterne.get(emp); }
+      }
+      if (member == null)
+      {
+        r.hikvisionUsersUnmatched++;
+        pl.log("kein jverein-Match für employeeNo=" + emp + " (" + u.optString("name") + ")");
+        continue;
+      }
+
+      // resolve each cardNo -> chip via ChipStore
+      List<String> userCards = cardsByEmp.getOrDefault(emp, new ArrayList<>());
+      List<String> resolvedChips = new ArrayList<>();
+      for (String cardNo : userCards)
+      {
+        String chip = chips.chipForCard(cardNo);
+        if (chip == null)
+        {
+          r.unknownCards++;
+          pl.log("WARN: Kartennummer " + cardNo + " (emp=" + emp + " " + u.optString("name")
+              + ") nicht im ChipStore — übersprungen");
+          continue;
+        }
+        resolvedChips.add(chip);
+      }
+      String proposed = String.join(",", resolvedChips);
+      String current = readZusatzfeld(member.getID(), transponderDefId);
+      if (current == null) current = "";
+      if (current.equals(proposed)) { r.membersUnchanged++; continue; }
+
+      pl.log("UPDATE jv_id=" + member.getID() + " " + member.getVorname() + " " + member.getName()
+          + ": '" + current + "' → '" + proposed + "'");
+      if (!dryRun)
+      {
+        try { writeZusatzfeld(member.getID(), transponderDef, proposed); r.membersUpdated++; }
+        catch (Exception e) { r.errors.add("write jv_id=" + member.getID() + ": " + e.getMessage()); }
+      }
+      else
+      {
+        r.membersUpdated++;   // counted as "would update" in dry-run
+      }
+    }
+
+    pl.log("=== DONE ===  updated=" + r.membersUpdated
+        + " unchanged=" + r.membersUnchanged
+        + " hikUnmatched=" + r.hikvisionUsersUnmatched
+        + " unknownCards=" + r.unknownCards
+        + " errors=" + r.errors.size());
+    return r;
+  }
+
+  /** Find-or-create the Zusatzfelder row for (mitglied, felddefinition) and write the string value. */
+  private static void writeZusatzfeld(String mitgliedId, Felddefinition def, String value) throws Exception
+  {
+    DBIterator<Zusatzfelder> it = Einstellungen.getDBService().createList(Zusatzfelder.class);
+    it.addFilter("mitglied = ?", mitgliedId);
+    it.addFilter("felddefinition = ?", def.getID());
+    Zusatzfelder z;
+    if (it.hasNext()) z = (Zusatzfelder) it.next();
+    else
+    {
+      z = (Zusatzfelder) Einstellungen.getDBService().createObject(Zusatzfelder.class, null);
+      z.setMitglied(Integer.parseInt(mitgliedId));
+      z.setFelddefinition(Integer.parseInt(def.getID()));
+    }
+    z.setFeld(value == null || value.isEmpty() ? null : value);
+    z.store();
   }
 }

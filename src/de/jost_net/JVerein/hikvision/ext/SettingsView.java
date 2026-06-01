@@ -1,14 +1,26 @@
 package de.jost_net.JVerein.hikvision.ext;
 
+import java.io.File;
+import java.util.List;
+
 import org.eclipse.swt.SWT;
 import org.eclipse.swt.events.SelectionAdapter;
 import org.eclipse.swt.events.SelectionEvent;
 import org.eclipse.swt.layout.GridData;
+import org.eclipse.swt.layout.GridLayout;
 import org.eclipse.swt.widgets.Button;
 import org.eclipse.swt.widgets.Composite;
 import org.eclipse.swt.widgets.Display;
+import org.eclipse.swt.widgets.FileDialog;
+import org.eclipse.swt.widgets.Label;
+import org.eclipse.swt.widgets.MessageBox;
+import org.eclipse.swt.widgets.Shell;
+import org.eclipse.swt.widgets.Table;
+import org.eclipse.swt.widgets.TableColumn;
+import org.eclipse.swt.widgets.TableItem;
 import org.eclipse.swt.widgets.Text;
 
+import de.jost_net.JVerein.hikvision.ChipStore;
 import de.jost_net.JVerein.hikvision.HikvisionSettings;
 import de.jost_net.JVerein.hikvision.SyncEngine;
 import de.willuhn.jameica.gui.extension.Extendable;
@@ -28,16 +40,16 @@ import de.willuhn.logging.Logger;
 import de.willuhn.util.ApplicationException;
 
 /**
- * Hikvision-Reiter in Datei → Einstellungen. Zeigt die Konfiguration,
- * speichert beim "Speichern"-Button und bietet einen "Synchronisieren"-
- * Button für den manuellen Sync.
+ * Two tabs added to Datei → Einstellungen:
+ *   "Hikvision"        — connection config + Sync/Import buttons + log
+ *   "Hikvision Chips"  — manage chip ↔ Kartennummer entries with
+ *                        add/edit/delete + CSV import/export
  */
 public class SettingsView implements Extension
 {
   private TextInput url;
   private TextInput user;
   private PasswordInput password;
-  private TextInput csvPath;
   private TextInput memberGroupId;
   private TextInput memberGroupName;
   private TextInput sponsorGroupId;
@@ -46,11 +58,17 @@ public class SettingsView implements Extension
   private TextInput zusatzfeldName;
   private IntegerInput interCallPauseMs;
   private CheckboxInput dryRun;
-
   private Text logArea;
   private Button syncButton;
+  private Button importButton;
+
+  private Table chipTable;
+  private ChipStore store;
 
   private MessageConsumer consumer;
+
+  @FunctionalInterface
+  private interface OnClick { void onClick(); }
 
   @Override
   public void extend(Extendable extendable)
@@ -58,9 +76,18 @@ public class SettingsView implements Extension
     if (!(extendable instanceof Settings)) return;
     Settings settings = (Settings) extendable;
 
+    try { store = ChipStore.defaultStore(); }
+    catch (Exception e)
+    {
+      Logger.error("ChipStore konnte nicht geladen werden", e);
+      Application.getMessagingFactory().sendMessage(new StatusBarMessage(
+          "ChipStore konnte nicht geladen werden: " + e.getMessage(), StatusBarMessage.TYPE_ERROR));
+      return;
+    }
+
     consumer = new MessageConsumer()
     {
-      @Override public void handleMessage(Message m) throws Exception { store(); }
+      @Override public void handleMessage(Message m) throws Exception { storeConfig(); }
       @Override public Class<?>[] getExpectedMessageTypes()
       { return new Class[] { SettingsChangedMessage.class }; }
       @Override public boolean autoRegister() { return false; }
@@ -69,51 +96,8 @@ public class SettingsView implements Extension
 
     try
     {
-      TabGroup tab = new TabGroup(settings.getTabFolder(), "Hikvision");
-      tab.getComposite().addDisposeListener(e -> {
-        Application.getMessagingFactory().unRegisterMessageConsumer(consumer);
-      });
-
-      url = new TextInput(HikvisionSettings.getControllerUrl(), 200);
-      user = new TextInput(HikvisionSettings.getControllerUser(), 64);
-      password = new PasswordInput(HikvisionSettings.getControllerPassword());
-      csvPath = new TextInput(HikvisionSettings.getCsvPath(), 250);
-      memberGroupId = new TextInput(HikvisionSettings.getMemberGroupId(), 64);
-      memberGroupName = new TextInput(HikvisionSettings.getMemberGroupName(), 64);
-      sponsorGroupId = new TextInput(HikvisionSettings.getSponsorGroupId(), 64);
-      sponsorGroupName = new TextInput(HikvisionSettings.getSponsorGroupName(), 64);
-      regionPermissionGroup = new IntegerInput(HikvisionSettings.getRegionPermissionGroup());
-      zusatzfeldName = new TextInput(HikvisionSettings.getZusatzfeldName(), 64);
-      interCallPauseMs = new IntegerInput(HikvisionSettings.getInterCallPauseMs());
-      dryRun = new CheckboxInput(HikvisionSettings.getDryRun());
-
-      tab.addLabelPair("Controller-URL", url);
-      tab.addLabelPair("Benutzer", user);
-      tab.addLabelPair("Passwort", password);
-      tab.addLabelPair("CSV-Pfad (Chip,Kartennummer)", csvPath);
-      tab.addLabelPair("Mitglieder Gruppen-ID (UUID)", memberGroupId);
-      tab.addLabelPair("Mitglieder Gruppen-Name", memberGroupName);
-      tab.addLabelPair("Sponsor Gruppen-ID (UUID)", sponsorGroupId);
-      tab.addLabelPair("Sponsor Gruppen-Name", sponsorGroupName);
-      tab.addLabelPair("Region-Permission-Gruppe (Türrechte)", regionPermissionGroup);
-      tab.addLabelPair("Zusatzfeld-Name (transponder)", zusatzfeldName);
-      tab.addLabelPair("Pause zwischen Calls (ms)", interCallPauseMs);
-      tab.addCheckbox(dryRun, "Trockenlauf — nur loggen, keine Schreibvorgänge");
-
-      // sync button + log area
-      Composite c = tab.getComposite();
-      syncButton = new Button(c, SWT.PUSH);
-      syncButton.setText("Jetzt synchronisieren");
-      syncButton.setLayoutData(new GridData(SWT.FILL, SWT.CENTER, true, false, 2, 1));
-      syncButton.addSelectionListener(new SelectionAdapter()
-      {
-        @Override public void widgetSelected(SelectionEvent e) { onSyncClick(); }
-      });
-
-      logArea = new Text(c, SWT.MULTI | SWT.BORDER | SWT.V_SCROLL | SWT.H_SCROLL | SWT.READ_ONLY);
-      GridData gd = new GridData(SWT.FILL, SWT.FILL, true, true, 2, 1);
-      gd.heightHint = 300;
-      logArea.setLayoutData(gd);
+      buildSyncTab(settings);
+      buildChipsTab(settings);
     }
     catch (Exception e)
     {
@@ -123,14 +107,68 @@ public class SettingsView implements Extension
     }
   }
 
-  private void store() throws ApplicationException
+  // ============================================================ Sync tab
+
+  private void buildSyncTab(Settings settings) throws Exception
+  {
+    TabGroup tab = new TabGroup(settings.getTabFolder(), "Hikvision");
+    tab.getComposite().addDisposeListener(e -> {
+      Application.getMessagingFactory().unRegisterMessageConsumer(consumer);
+    });
+
+    url = new TextInput(HikvisionSettings.getControllerUrl(), 200);
+    user = new TextInput(HikvisionSettings.getControllerUser(), 64);
+    password = new PasswordInput(HikvisionSettings.getControllerPassword());
+    memberGroupId = new TextInput(HikvisionSettings.getMemberGroupId(), 64);
+    memberGroupName = new TextInput(HikvisionSettings.getMemberGroupName(), 64);
+    sponsorGroupId = new TextInput(HikvisionSettings.getSponsorGroupId(), 64);
+    sponsorGroupName = new TextInput(HikvisionSettings.getSponsorGroupName(), 64);
+    regionPermissionGroup = new IntegerInput(HikvisionSettings.getRegionPermissionGroup());
+    zusatzfeldName = new TextInput(HikvisionSettings.getZusatzfeldName(), 64);
+    interCallPauseMs = new IntegerInput(HikvisionSettings.getInterCallPauseMs());
+    dryRun = new CheckboxInput(HikvisionSettings.getDryRun());
+
+    tab.addLabelPair("Controller-URL", url);
+    tab.addLabelPair("Benutzer", user);
+    tab.addLabelPair("Passwort", password);
+    tab.addLabelPair("Mitglieder Gruppen-ID (UUID)", memberGroupId);
+    tab.addLabelPair("Mitglieder Gruppen-Name", memberGroupName);
+    tab.addLabelPair("Sponsor Gruppen-ID (UUID)", sponsorGroupId);
+    tab.addLabelPair("Sponsor Gruppen-Name", sponsorGroupName);
+    tab.addLabelPair("Region-Permission-Gruppe (Türrechte)", regionPermissionGroup);
+    tab.addLabelPair("Zusatzfeld-Name (transponder)", zusatzfeldName);
+    tab.addLabelPair("Pause zwischen Calls (ms)", interCallPauseMs);
+    tab.addCheckbox(dryRun, "Trockenlauf — nur loggen, keine Schreibvorgänge");
+
+    Composite c = tab.getComposite();
+
+    syncButton = new Button(c, SWT.PUSH);
+    syncButton.setText("Jetzt synchronisieren (jverein → Hikvision)");
+    syncButton.setLayoutData(new GridData(SWT.FILL, SWT.CENTER, true, false, 2, 1));
+    syncButton.addSelectionListener(new SelectionAdapter() {
+      @Override public void widgetSelected(SelectionEvent e) { onSyncClick(); }
+    });
+
+    importButton = new Button(c, SWT.PUSH);
+    importButton.setText("Aus Hikvision importieren (überschreibt jverein-Transponder!)");
+    importButton.setLayoutData(new GridData(SWT.FILL, SWT.CENTER, true, false, 2, 1));
+    importButton.addSelectionListener(new SelectionAdapter() {
+      @Override public void widgetSelected(SelectionEvent e) { onImportClick(); }
+    });
+
+    logArea = new Text(c, SWT.MULTI | SWT.BORDER | SWT.V_SCROLL | SWT.H_SCROLL | SWT.READ_ONLY);
+    GridData gd = new GridData(SWT.FILL, SWT.FILL, true, true, 2, 1);
+    gd.heightHint = 300;
+    logArea.setLayoutData(gd);
+  }
+
+  private void storeConfig() throws ApplicationException
   {
     try
     {
       HikvisionSettings.setControllerUrl((String) url.getValue());
       HikvisionSettings.setControllerUser((String) user.getValue());
       HikvisionSettings.setControllerPassword((String) password.getValue());
-      HikvisionSettings.setCsvPath((String) csvPath.getValue());
       HikvisionSettings.setMemberGroupId((String) memberGroupId.getValue());
       HikvisionSettings.setMemberGroupName((String) memberGroupName.getValue());
       HikvisionSettings.setSponsorGroupId((String) sponsorGroupId.getValue());
@@ -147,41 +185,74 @@ public class SettingsView implements Extension
 
   private void onSyncClick()
   {
-    syncButton.setEnabled(false);
-    logArea.setText("");
-    boolean dry = Boolean.TRUE.equals(dryRun.getValue());
-    appendLog("Sync gestartet (" + (dry ? "Trockenlauf" : "APPLY") + ") …\n");
+    runInBackground(() -> {
+      storeConfig();
+      SyncEngine.Result r = SyncEngine.run(isDryRun(), progressListener());
+      appendLog("\nFertig (Sync). created=" + r.created + " deleted=" + r.deleted
+          + " cardsAdded=" + r.cardsAdded + " cardsRemoved=" + r.cardsRemoved
+          + " skipped=" + r.skippedMembers + " unknownCards=" + r.unknownCards
+          + " errors=" + r.errors.size() + "\n");
+      if (!r.errors.isEmpty())
+      { appendLog("\nFehler:\n"); for (String e : r.errors) appendLog("  " + e + "\n"); }
+    }, "Sync gestartet");
+  }
 
+  private void onImportClick()
+  {
+    if (!isDryRun() && !confirm(
+        "Aus Hikvision importieren",
+        "Dieser Vorgang überschreibt die transponder-Zusatzfelder aller "
+        + "passenden jverein-Mitglieder mit den Werten aus dem "
+        + "Zutrittssystem. Wirklich fortfahren?"))
+      return;
+    runInBackground(() -> {
+      storeConfig();
+      SyncEngine.ImportResult r = SyncEngine.importFromHikvision(isDryRun(), progressListener());
+      appendLog("\nFertig (Import). updated=" + r.membersUpdated
+          + " unchanged=" + r.membersUnchanged
+          + " hikUnmatched=" + r.hikvisionUsersUnmatched
+          + " unknownCards=" + r.unknownCards
+          + " errors=" + r.errors.size() + "\n");
+      if (!r.errors.isEmpty())
+      { appendLog("\nFehler:\n"); for (String e : r.errors) appendLog("  " + e + "\n"); }
+    }, "Import gestartet");
+  }
+
+  private boolean isDryRun() { return Boolean.TRUE.equals(dryRun.getValue()); }
+
+  private SyncEngine.ProgressListener progressListener()
+  {
+    return new SyncEngine.ProgressListener()
+    {
+      @Override public void log(String msg) { appendLog(msg + "\n"); }
+      @Override public void progress(int done, int total) {}
+    };
+  }
+
+  @FunctionalInterface
+  private interface BgTask { void run() throws Exception; }
+
+  private void runInBackground(BgTask task, String startMsg)
+  {
+    syncButton.setEnabled(false);
+    importButton.setEnabled(false);
+    logArea.setText("");
+    appendLog(startMsg + " (" + (isDryRun() ? "Trockenlauf" : "APPLY") + ") …\n");
     Thread t = new Thread(() -> {
-      try
-      {
-        // persist current values before sync, in case user edited but didn't click Speichern
-        store();
-        SyncEngine.Result r = SyncEngine.run(dry, new SyncEngine.ProgressListener()
-        {
-          @Override public void log(String msg) { appendLog(msg + "\n"); }
-          @Override public void progress(int done, int total) { /* could update a progress bar */ }
-        });
-        appendLog("\nFertig. created=" + r.created + " deleted=" + r.deleted
-            + " cardsAdded=" + r.cardsAdded + " cardsRemoved=" + r.cardsRemoved
-            + " skipped=" + r.skippedMembers + " unknownCards=" + r.unknownCards
-            + " errors=" + r.errors.size() + "\n");
-        if (!r.errors.isEmpty())
-        {
-          appendLog("\nFehler:\n");
-          for (String err : r.errors) appendLog("  " + err + "\n");
-        }
-      }
+      try { task.run(); }
       catch (Exception e)
       {
-        Logger.error("Sync failed", e);
+        Logger.error("Hikvision task failed", e);
         appendLog("\nFEHLER: " + e.getClass().getSimpleName() + ": " + e.getMessage() + "\n");
       }
       finally
       {
-        Display.getDefault().asyncExec(() -> syncButton.setEnabled(true));
+        Display.getDefault().asyncExec(() -> {
+          if (syncButton != null && !syncButton.isDisposed()) syncButton.setEnabled(true);
+          if (importButton != null && !importButton.isDisposed()) importButton.setEnabled(true);
+        });
       }
-    }, "jverein.hikvision-sync");
+    }, "jverein.hikvision-task");
     t.setDaemon(true);
     t.start();
   }
@@ -191,5 +262,163 @@ public class SettingsView implements Extension
     Display.getDefault().asyncExec(() -> {
       if (logArea != null && !logArea.isDisposed()) logArea.append(s);
     });
+  }
+
+  private boolean confirm(String title, String message)
+  {
+    Shell sh = Display.getDefault().getActiveShell();
+    MessageBox box = new MessageBox(sh, SWT.ICON_WARNING | SWT.YES | SWT.NO);
+    box.setText(title);
+    box.setMessage(message);
+    return box.open() == SWT.YES;
+  }
+
+  // =========================================================== Chips tab
+
+  private void buildChipsTab(Settings settings) throws Exception
+  {
+    TabGroup tab = new TabGroup(settings.getTabFolder(), "Hikvision Chips");
+    Composite c = tab.getComposite();
+
+    Label info = new Label(c, SWT.WRAP);
+    info.setText("Chip ↔ Kartennummer-Zuordnungen werden in Jameica gespeichert "
+        + "(cfg/Chips.json). Für Backup oder externe Verarbeitung können sie "
+        + "als CSV exportiert / importiert werden.");
+    GridData infoGd = new GridData(SWT.FILL, SWT.CENTER, true, false, 2, 1);
+    infoGd.widthHint = 600;
+    info.setLayoutData(infoGd);
+
+    chipTable = new Table(c, SWT.BORDER | SWT.FULL_SELECTION | SWT.V_SCROLL | SWT.SINGLE);
+    chipTable.setHeaderVisible(true);
+    chipTable.setLinesVisible(true);
+    GridData tgd = new GridData(SWT.FILL, SWT.FILL, true, true, 2, 1);
+    tgd.heightHint = 400; tgd.widthHint = 600;
+    chipTable.setLayoutData(tgd);
+
+    TableColumn col1 = new TableColumn(chipTable, SWT.LEFT);
+    col1.setText("Chip"); col1.setWidth(160);
+    TableColumn col2 = new TableColumn(chipTable, SWT.LEFT);
+    col2.setText("Kartennummer"); col2.setWidth(220);
+    refreshChipTable();
+
+    chipTable.addSelectionListener(new SelectionAdapter() {
+      @Override public void widgetDefaultSelected(SelectionEvent e) { onEditChip(); }
+    });
+
+    Composite btnRow = new Composite(c, SWT.NONE);
+    GridData brGd = new GridData(SWT.FILL, SWT.CENTER, true, false, 2, 1);
+    btnRow.setLayoutData(brGd);
+    btnRow.setLayout(new GridLayout(5, false));
+
+    mkButton(btnRow, "Hinzufügen…", () -> onAddChip());
+    mkButton(btnRow, "Bearbeiten…", () -> onEditChip());
+    mkButton(btnRow, "Löschen",     () -> onDeleteChip());
+    mkButton(btnRow, "Aus CSV importieren…", () -> onImportCsv());
+    mkButton(btnRow, "Als CSV exportieren…", () -> onExportCsv());
+  }
+
+  private void mkButton(Composite parent, String text, OnClick listener)
+  {
+    Button b = new Button(parent, SWT.PUSH);
+    b.setText(text);
+    b.setLayoutData(new GridData(SWT.FILL, SWT.CENTER, true, false));
+    b.addSelectionListener(new SelectionAdapter() {
+      @Override public void widgetSelected(SelectionEvent e) { listener.onClick(); }
+    });
+  }
+
+  private void refreshChipTable()
+  {
+    if (chipTable == null || chipTable.isDisposed()) return;
+    chipTable.removeAll();
+    List<String[]> rows = store.rows();
+    for (String[] row : rows)
+    {
+      TableItem ti = new TableItem(chipTable, SWT.NONE);
+      ti.setText(0, row[0]);
+      ti.setText(1, row[1]);
+    }
+  }
+
+  private void onAddChip()
+  {
+    String[] vals = ChipEditDialog.open(Display.getDefault().getActiveShell(), "Chip hinzufügen", "", "");
+    if (vals == null) return;
+    try { store.put(vals[0], vals[1]); store.save(); refreshChipTable(); }
+    catch (Exception e) { showError("Hinzufügen fehlgeschlagen", e.getMessage()); }
+  }
+
+  private void onEditChip()
+  {
+    int idx = chipTable.getSelectionIndex();
+    if (idx < 0) return;
+    TableItem ti = chipTable.getItem(idx);
+    String oldChip = ti.getText(0);
+    String oldCard = ti.getText(1);
+    String[] vals = ChipEditDialog.open(Display.getDefault().getActiveShell(), "Chip bearbeiten", oldChip, oldCard);
+    if (vals == null) return;
+    try
+    {
+      if (!vals[0].equals(oldChip)) store.removeByChip(oldChip);
+      store.put(vals[0], vals[1]);
+      store.save();
+      refreshChipTable();
+    }
+    catch (Exception e) { showError("Bearbeiten fehlgeschlagen", e.getMessage()); }
+  }
+
+  private void onDeleteChip()
+  {
+    int idx = chipTable.getSelectionIndex();
+    if (idx < 0) return;
+    TableItem ti = chipTable.getItem(idx);
+    String chip = ti.getText(0);
+    if (!confirm("Löschen", "Chip-Eintrag '" + chip + "' wirklich löschen?")) return;
+    try { store.removeByChip(chip); store.save(); refreshChipTable(); }
+    catch (Exception e) { showError("Löschen fehlgeschlagen", e.getMessage()); }
+  }
+
+  private void onImportCsv()
+  {
+    FileDialog fd = new FileDialog(Display.getDefault().getActiveShell(), SWT.OPEN);
+    fd.setText("Chip-CSV importieren");
+    fd.setFilterExtensions(new String[] { "*.csv", "*.*" });
+    String path = fd.open();
+    if (path == null) return;
+    boolean overwrite = confirm("Import-Modus",
+        "Bestehende Chips überschreiben?\n\n"
+        + "Ja  = Eintrag wird überschrieben falls Chip bereits existiert\n"
+        + "Nein = bestehende Einträge bleiben, nur neue werden hinzugefügt");
+    try
+    {
+      int[] r = store.importCsv(new File(path), overwrite);
+      refreshChipTable();
+      showInfo("Import abgeschlossen", "Hinzugefügt: " + r[0] + "\nAktualisiert: " + r[1] + "\nÜbersprungen: " + r[2]);
+    }
+    catch (Exception e) { showError("Import fehlgeschlagen", e.getMessage()); }
+  }
+
+  private void onExportCsv()
+  {
+    FileDialog fd = new FileDialog(Display.getDefault().getActiveShell(), SWT.SAVE);
+    fd.setText("Chip-CSV exportieren");
+    fd.setFileName("chip_kartennummer.csv");
+    fd.setFilterExtensions(new String[] { "*.csv", "*.*" });
+    String path = fd.open();
+    if (path == null) return;
+    try { store.exportCsv(new File(path)); showInfo("Export abgeschlossen", store.size() + " Einträge geschrieben nach\n" + path); }
+    catch (Exception e) { showError("Export fehlgeschlagen", e.getMessage()); }
+  }
+
+  private void showError(String title, String message)
+  {
+    MessageBox box = new MessageBox(Display.getDefault().getActiveShell(), SWT.ICON_ERROR | SWT.OK);
+    box.setText(title); box.setMessage(message); box.open();
+  }
+
+  private void showInfo(String title, String message)
+  {
+    MessageBox box = new MessageBox(Display.getDefault().getActiveShell(), SWT.ICON_INFORMATION | SWT.OK);
+    box.setText(title); box.setMessage(message); box.open();
   }
 }
