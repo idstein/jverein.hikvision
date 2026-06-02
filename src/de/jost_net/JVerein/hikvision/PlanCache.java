@@ -56,6 +56,8 @@ public final class PlanCache
         o.put("name", n(r.name));
         o.put("userType", n(r.userType));
         o.put("groupName", n(r.groupName));
+        o.put("groupId", n(r.groupId));
+        o.put("regionPermissionGroups", new JSONArray(r.regionPermissionGroups));
         o.put("currentCards", new JSONArray(r.currentCards));
         o.put("desiredCards", new JSONArray(r.desiredCards));
         o.put("detail", n(r.detail));
@@ -115,10 +117,13 @@ public final class PlanCache
         r.name = o.optString("name", "");
         r.userType = o.optString("userType", "");
         r.groupName = o.optString("groupName", "");
+        r.groupId = o.optString("groupId", "");
         r.detail = o.optString("detail", "");
         r.jvereinName = o.optString("jvereinName", "");
         r.currentCards = toList(o.optJSONArray("currentCards"));
         r.desiredCards = toList(o.optJSONArray("desiredCards"));
+        JSONArray rp = o.optJSONArray("regionPermissionGroups");
+        if (rp != null) for (int k = 0; k < rp.length(); k++) r.regionPermissionGroups.add(rp.optInt(k));
         c.plan.rows.add(r);
       }
       return c;

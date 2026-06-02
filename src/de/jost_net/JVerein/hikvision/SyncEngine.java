@@ -88,6 +88,8 @@ public class SyncEngine
     public String name;
     public String userType;
     public String groupName;
+    public String groupId;                                          // userGroupNodeID UUID
+    public List<Integer> regionPermissionGroups = new ArrayList<>(); // regionPermissionGroupIDList
     public List<String> currentCards = new ArrayList<>();
     public List<String> desiredCards = new ArrayList<>();
     public Status status;
@@ -169,6 +171,8 @@ public class SyncEngine
       row.name = (safe(m.getVorname()) + " " + safe(m.getName())).trim();
       row.userType = id.isSponsor ? "visitor" : "normal";
       row.groupName = id.isSponsor ? HikvisionSettings.getSponsorGroupName() : HikvisionSettings.getMemberGroupName();
+      row.groupId = id.isSponsor ? HikvisionSettings.getSponsorGroupId() : HikvisionSettings.getMemberGroupId();
+      row.regionPermissionGroups.add(HikvisionSettings.getRegionPermissionGroup());
       row.desiredCards = desiredCards;
       row.jvereinName = row.name;
       desired.put(id.employeeNo, row);
@@ -209,6 +213,8 @@ public class SyncEngine
         row.name = u.optString("name", "");
         row.userType = u.optString("userType", "");
         row.groupName = u.optString("userGroupNodeName", "");
+        row.groupId = u.optString("userGroupNodeID", "");
+        copyRegionPermissions(u, row);
         row.currentCards = cur;
         row.status = Status.HIK_ONLY;
         row.detail = "unverwalteter employeeNo (z.B. SKM*) — wird bei Sync nie angefasst";
@@ -225,6 +231,8 @@ public class SyncEngine
         row.name = u.optString("name", "");
         row.userType = u.optString("userType", "");
         row.groupName = u.optString("userGroupNodeName", "");
+        row.groupId = u.optString("userGroupNodeID", "");
+        copyRegionPermissions(u, row);
         row.currentCards = cur;
         row.status = Status.DELETE;
 
@@ -286,6 +294,12 @@ public class SyncEngine
   }
 
   private static String safe(String s) { return s == null ? "" : s; }
+
+  private static void copyRegionPermissions(JSONObject u, PlanRow row)
+  {
+    JSONArray rp = u.optJSONArray("regionPermissionGroupIDList");
+    if (rp != null) for (int i = 0; i < rp.length(); i++) row.regionPermissionGroups.add(rp.optInt(i));
+  }
 
   /**
    * Build desired state from jverein + ChipStore. Returns map: employeeNo -> Desired.
