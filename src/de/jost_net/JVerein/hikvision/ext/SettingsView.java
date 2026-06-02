@@ -45,8 +45,10 @@ import de.willuhn.jameica.messaging.MessageConsumer;
 import de.willuhn.jameica.messaging.SettingsChangedMessage;
 import de.willuhn.jameica.messaging.StatusBarMessage;
 import de.willuhn.jameica.system.Application;
+import de.willuhn.jameica.system.BackgroundTask;
 import de.willuhn.logging.Logger;
 import de.willuhn.util.ApplicationException;
+import de.willuhn.util.ProgressMonitor;
 
 /**
  * Two tabs added to Datei → Einstellungen:
@@ -214,16 +216,16 @@ public class SettingsView implements Extension
 
   private void onSyncClick()
   {
-    runInBackground(() -> {
+    startTabTask("Hikvision Sync", "Sync gestartet", mon -> {
       storeConfig();
-      SyncEngine.Result r = SyncEngine.run(isDryRun(), progressListener());
+      SyncEngine.Result r = SyncEngine.run(isDryRun(), syncTabListener(mon));
       appendLog("\nFertig (Sync). created=" + r.created + " deleted=" + r.deleted
           + " cardsAdded=" + r.cardsAdded + " cardsRemoved=" + r.cardsRemoved
           + " skipped=" + r.skippedMembers + " unknownCards=" + r.unknownCards
           + " errors=" + r.errors.size() + "\n");
       if (!r.errors.isEmpty())
       { appendLog("\nFehler:\n"); for (String e : r.errors) appendLog("  " + e + "\n"); }
-    }, "Sync gestartet");
+    });
   }
 
   private void onImportClick()
@@ -234,9 +236,9 @@ public class SettingsView implements Extension
         + "passenden jverein-Mitglieder mit den Werten aus dem "
         + "Zutrittssystem. Wirklich fortfahren?"))
       return;
-    runInBackground(() -> {
+    startTabTask("Hikvision Import", "Import gestartet", mon -> {
       storeConfig();
-      SyncEngine.ImportResult r = SyncEngine.importFromHikvision(isDryRun(), progressListener());
+      SyncEngine.ImportResult r = SyncEngine.importFromHikvision(isDryRun(), syncTabListener(mon));
       appendLog("\nFertig (Import). updated=" + r.membersUpdated
           + " unchanged=" + r.membersUnchanged
           + " hikUnmatched=" + r.hikvisionUsersUnmatched
@@ -244,19 +246,88 @@ public class SettingsView implements Extension
           + " errors=" + r.errors.size() + "\n");
       if (!r.errors.isEmpty())
       { appendLog("\nFehler:\n"); for (String e : r.errors) appendLog("  " + e + "\n"); }
-    }, "Import gestartet");
+    });
+  }
+
+  @FunctionalInterface
+  private interface MonitoredTask
+  {
+    void run(ProgressMonitor mon) throws Exception;
+  }
+
+  /**
+   * Submit a task to Jameica's BackgroundTask queue. The global status bar
+   * shows the progress (and a cancel button). The in-tab ProgressBar
+   * receives the same updates via {@link #syncTabListener}.
+   */
+  private void startTabTask(String taskName, String startMsg, MonitoredTask body)
+  {
+    syncButton.setEnabled(false);
+    importButton.setEnabled(false);
+    logArea.setText("");
+    appendLog(startMsg + " (" + (isDryRun() ? "Trockenlauf" : "APPLY") + ") …\n");
+    if (syncProgress != null && !syncProgress.isDisposed())
+    { syncProgress.setMaximum(100); syncProgress.setSelection(0); }
+    if (syncProgressLabel != null && !syncProgressLabel.isDisposed())
+      syncProgressLabel.setText(" ");
+
+    Application.getController().start(new HikvisionBackgroundTask()
+    {
+      @Override
+      public void run(ProgressMonitor monitor) throws ApplicationException
+      {
+        try
+        {
+          monitor.setStatusText(taskName + " läuft …");
+          body.run(monitor);
+          monitor.setStatus(ProgressMonitor.STATUS_DONE);
+          monitor.setPercentComplete(100);
+        }
+        catch (Exception e)
+        {
+          Logger.error(taskName + " failed", e);
+          appendLog("\nFEHLER: " + e.getClass().getSimpleName() + ": " + e.getMessage() + "\n");
+          monitor.log("FEHLER: " + e.getMessage());
+          monitor.setStatus(ProgressMonitor.STATUS_ERROR);
+          throw new ApplicationException(e.getMessage(), e);
+        }
+        finally
+        {
+          Display.getDefault().asyncExec(() -> {
+            if (syncButton != null && !syncButton.isDisposed()) syncButton.setEnabled(true);
+            if (importButton != null && !importButton.isDisposed()) importButton.setEnabled(true);
+          });
+        }
+      }
+    });
   }
 
   private boolean isDryRun() { return Boolean.TRUE.equals(dryRun.getValue()); }
 
-  private SyncEngine.ProgressListener progressListener()
+  /**
+   * Builds a ProgressListener that drives both Jameica's global status bar
+   * (via the ProgressMonitor) AND the in-tab ProgressBar widgets on the
+   * sync tab. The Jameica monitor is the canonical place — the in-tab bar
+   * is a supplemental at-a-glance indicator next to the button.
+   */
+  private SyncEngine.ProgressListener syncTabListener(ProgressMonitor mon)
   {
     return new SyncEngine.ProgressListener()
     {
-      @Override public void log(String msg) { appendLog(msg + "\n"); }
+      @Override public void log(String msg)
+      {
+        if (mon != null) mon.log(msg);
+        appendLog(msg + "\n");
+      }
       @Override public void progress(int done, int total) { progress(done, total, ""); }
       @Override public void progress(int done, int total, String phase)
       {
+        if (mon != null)
+        {
+          int pct = total > 0 ? (int) (100L * Math.min(done, total) / total) : 0;
+          mon.setPercentComplete(pct);
+          mon.setStatusText(phase + "  " + done + " / " + total);
+        }
         Display.getDefault().asyncExec(() -> {
           if (syncProgress != null && !syncProgress.isDisposed())
           {
@@ -271,37 +342,6 @@ public class SettingsView implements Extension
     };
   }
 
-  @FunctionalInterface
-  private interface BgTask { void run() throws Exception; }
-
-  private void runInBackground(BgTask task, String startMsg)
-  {
-    syncButton.setEnabled(false);
-    importButton.setEnabled(false);
-    logArea.setText("");
-    appendLog(startMsg + " (" + (isDryRun() ? "Trockenlauf" : "APPLY") + ") …\n");
-    if (syncProgress != null && !syncProgress.isDisposed())
-    { syncProgress.setMaximum(100); syncProgress.setSelection(0); }
-    if (syncProgressLabel != null && !syncProgressLabel.isDisposed())
-      syncProgressLabel.setText(" ");
-    Thread t = new Thread(() -> {
-      try { task.run(); }
-      catch (Exception e)
-      {
-        Logger.error("Hikvision task failed", e);
-        appendLog("\nFEHLER: " + e.getClass().getSimpleName() + ": " + e.getMessage() + "\n");
-      }
-      finally
-      {
-        Display.getDefault().asyncExec(() -> {
-          if (syncButton != null && !syncButton.isDisposed()) syncButton.setEnabled(true);
-          if (importButton != null && !importButton.isDisposed()) importButton.setEnabled(true);
-        });
-      }
-    }, "jverein.hikvision-task");
-    t.setDaemon(true);
-    t.start();
-  }
 
   private void appendLog(String s)
   {
@@ -632,64 +672,86 @@ public class SettingsView implements Extension
       if (usersProgress != null && !usersProgress.isDisposed())
       { usersProgress.setMaximum(100); usersProgress.setSelection(0); }
     });
-    Thread t = new Thread(() -> {
-      try
-      {
-        storeConfig();
-        ChipStore chipStore = ChipStore.defaultStore();
-        HikvisionClient client = new HikvisionClient(
-            HikvisionSettings.getControllerUrl(), HikvisionSettings.getControllerUser(),
-            HikvisionSettings.getControllerPassword(), HikvisionSettings.getInterCallPauseMs());
 
-        SyncEngine.Plan plan = SyncEngine.computePlan(chipStore, client, new SyncEngine.ProgressListener()
+    Application.getController().start(new HikvisionBackgroundTask()
+    {
+      @Override
+      public void run(ProgressMonitor monitor) throws ApplicationException
+      {
+        try
         {
-          @Override public void log(String msg) { Logger.info(msg); }
-          @Override public void progress(int done, int total) { progress(done, total, ""); }
-          @Override public void progress(int done, int total, String phase)
+          monitor.setStatusText("Hikvision Aktualisierung läuft …");
+          storeConfig();
+          ChipStore chipStore = ChipStore.defaultStore();
+          HikvisionClient client = new HikvisionClient(
+              HikvisionSettings.getControllerUrl(), HikvisionSettings.getControllerUser(),
+              HikvisionSettings.getControllerPassword(), HikvisionSettings.getInterCallPauseMs());
+
+          SyncEngine.Plan plan = SyncEngine.computePlan(chipStore, client, usersTabListener(monitor));
+
+          currentPlanRows = plan.rows;
+          final String summary = plan.rows.size() + " Einträge — "
+              + plan.create + " neu, " + plan.update + " geändert, " + plan.delete + " löschen, "
+              + plan.hikOnly + " unverwaltet, " + plan.ok + " in sync"
+              + (plan.unknownCards > 0 ? "  (⚠ " + plan.unknownCards + " unbekannte Chips)" : "")
+              + "  · letzter Abruf: gerade eben";
+
+          Display.getDefault().asyncExec(() -> {
+            if (usersCount != null && !usersCount.isDisposed()) usersCount.setText(summary);
+            renderPlanRows();
+          });
+          monitor.setStatus(ProgressMonitor.STATUS_DONE);
+          monitor.setPercentComplete(100);
+        }
+        catch (Exception e)
+        {
+          Logger.error("user refresh failed", e);
+          Display.getDefault().asyncExec(() -> {
+            if (usersCount != null && !usersCount.isDisposed()) usersCount.setText("Fehler");
+            showError("Aktualisieren fehlgeschlagen", e.getClass().getSimpleName() + ": " + e.getMessage());
+          });
+          monitor.log("FEHLER: " + e.getMessage());
+          monitor.setStatus(ProgressMonitor.STATUS_ERROR);
+          throw new ApplicationException(e.getMessage(), e);
+        }
+        finally
+        {
+          Display.getDefault().asyncExec(() -> {
+            if (refreshButton != null && !refreshButton.isDisposed()) refreshButton.setEnabled(true);
+            if (testButton != null && !testButton.isDisposed()) testButton.setEnabled(true);
+          });
+        }
+      }
+    });
+  }
+
+  /** Listener that drives Jameica's status bar AND the Benutzer-tab ProgressBar. */
+  private SyncEngine.ProgressListener usersTabListener(ProgressMonitor mon)
+  {
+    return new SyncEngine.ProgressListener()
+    {
+      @Override public void log(String msg) { if (mon != null) mon.log(msg); Logger.info(msg); }
+      @Override public void progress(int done, int total) { progress(done, total, ""); }
+      @Override public void progress(int done, int total, String phase)
+      {
+        if (mon != null)
+        {
+          int pct = total > 0 ? (int) (100L * Math.min(done, total) / total) : 0;
+          mon.setPercentComplete(pct);
+          mon.setStatusText(phase + "  " + done + " / " + total);
+        }
+        Display.getDefault().asyncExec(() -> {
+          if (usersProgress != null && !usersProgress.isDisposed())
           {
-            Display.getDefault().asyncExec(() -> {
-              if (usersProgress != null && !usersProgress.isDisposed())
-              {
-                int safeTotal = Math.max(total, 1);
-                usersProgress.setMaximum(safeTotal);
-                usersProgress.setSelection(Math.min(done, safeTotal));
-              }
-              if (usersCount != null && !usersCount.isDisposed())
-                usersCount.setText(phase + "  " + done + " / " + total + " …");
-            });
+            int safeTotal = Math.max(total, 1);
+            usersProgress.setMaximum(safeTotal);
+            usersProgress.setSelection(Math.min(done, safeTotal));
           }
-        });
-
-        currentPlanRows = plan.rows;
-        final String summary = plan.rows.size() + " Einträge — "
-            + plan.create + " neu, " + plan.update + " geändert, " + plan.delete + " löschen, "
-            + plan.hikOnly + " unverwaltet, " + plan.ok + " in sync"
-            + (plan.unknownCards > 0 ? "  (⚠ " + plan.unknownCards + " unbekannte Chips)" : "")
-            + "  · letzter Abruf: gerade eben";
-
-        Display.getDefault().asyncExec(() -> {
-          if (usersCount != null && !usersCount.isDisposed()) usersCount.setText(summary);
-          renderPlanRows();
+          if (usersCount != null && !usersCount.isDisposed())
+            usersCount.setText(phase + "  " + done + " / " + total + " …");
         });
       }
-      catch (Exception e)
-      {
-        Logger.error("user refresh failed", e);
-        Display.getDefault().asyncExec(() -> {
-          if (usersCount != null && !usersCount.isDisposed()) usersCount.setText("Fehler");
-          showError("Aktualisieren fehlgeschlagen", e.getClass().getSimpleName() + ": " + e.getMessage());
-        });
-      }
-      finally
-      {
-        Display.getDefault().asyncExec(() -> {
-          if (refreshButton != null && !refreshButton.isDisposed()) refreshButton.setEnabled(true);
-          if (testButton != null && !testButton.isDisposed()) testButton.setEnabled(true);
-        });
-      }
-    }, "jverein.hikvision-refresh");
-    t.setDaemon(true);
-    t.start();
+    };
   }
 
   /** Re-render the table from {@link #currentPlanRows} applying the filter dropdown. */
