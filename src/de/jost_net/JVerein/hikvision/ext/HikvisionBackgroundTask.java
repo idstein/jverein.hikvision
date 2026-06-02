@@ -15,7 +15,7 @@ import de.willuhn.jameica.system.BackgroundTask;
  * isn't currently interrupt-aware, so cancellation only takes effect at
  * the natural break between batches at the moment.
  */
-abstract class HikvisionBackgroundTask implements BackgroundTask
+public abstract class HikvisionBackgroundTask implements BackgroundTask
 {
   private volatile boolean interrupted = false;
 
