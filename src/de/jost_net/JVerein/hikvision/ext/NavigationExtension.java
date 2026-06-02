@@ -12,7 +12,7 @@ import de.willuhn.jameica.gui.extension.Extension;
 import de.willuhn.logging.Logger;
 
 /**
- * Adds a "Hikvision" subtree to the OpenJVerein navigation. Registered
+ * Adds a "Zugangssystem" subtree to the OpenJVerein navigation. Registered
  * in plugin.xml as an extension of {@code jverein.main} — that's the
  * navigation root JVerein declares in its own plugin.xml. Reuses
  * JVerein's {@code MyItem} so the icons / styling match the surrounding
@@ -39,11 +39,11 @@ public class NavigationExtension implements Extension
       NavigationItem parent = findChild(jverein, "Mitglieder");
       if (parent == null)
       {
-        Logger.info("Mitglieder-Knoten nicht gefunden — Hikvision-Untermenü wird unter OpenJVerein angelegt");
+        Logger.info("Mitglieder-Knoten nicht gefunden — Zugangssystem-Untermenü wird unter OpenJVerein angelegt");
         parent = jverein;
       }
 
-      NavigationItem hik = new MyItem(parent, "Hikvision", null);
+      NavigationItem hik = new MyItem(parent, "Zugangssystem", null);
       parent.addChild(hik);
       hik.addChild(new MyItem(hik, "Benutzer",              new HikvisionBenutzerAction()));
       hik.addChild(new MyItem(hik, "Chips",                 new HikvisionChipsAction()));

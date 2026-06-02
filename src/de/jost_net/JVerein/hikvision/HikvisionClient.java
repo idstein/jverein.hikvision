@@ -318,6 +318,41 @@ public class HikvisionClient
     return request("GET", "/ISAPI/System/deviceInfo", null);
   }
 
+  /**
+   * UserRightPlanTemplate — the controller's time-based permission templates.
+   * Returns a map of planTemplateID → templateName for any template that has
+   * a non-empty name. Pagination is 1-based (not 0-based) with a per-page
+   * cap of 20, which surprised me when I first tried.
+   */
+  public java.util.Map<Integer, String> listRightPlanTemplateNames() throws IOException
+  {
+    java.util.Map<Integer, String> names = new java.util.HashMap<>();
+    int pos = 1;
+    while (true)
+    {
+      JSONObject body = new JSONObject()
+          .put("searchID", "rt-" + pos)
+          .put("searchResultPosition", pos)
+          .put("maxResults", 20);
+      JSONObject res = new JSONObject(request("POST",
+          "/ISAPI/AccessControl/UserRightPlanTemplate/Search?format=json", body.toString()));
+      int total = res.optInt("totalMatches", 0);
+      JSONArray items = res.optJSONArray("matchResults");
+      if (items == null || items.length() == 0) break;
+      for (int i = 0; i < items.length(); i++)
+      {
+        JSONObject t = items.getJSONObject(i);
+        int id = t.optInt("planTemplateID", -1);
+        String name = t.optString("templateName", "").trim();
+        if (id >= 0 && !name.isEmpty()) names.put(id, name);
+      }
+      pos += items.length();
+      if (pos > total) break;
+      pace();
+    }
+    return names;
+  }
+
   // ---------------------------------------------- TLS: trust self-signed
 
   private static SSLContext trustAllSslContext()

@@ -26,12 +26,12 @@ public class HikvisionGruppenView extends AbstractView
   @Override
   public void bind() throws Exception
   {
-    GUI.getView().setTitle("Hikvision Organisationsgruppen");
+    GUI.getView().setTitle("Zugangssystem Organisationsgruppen");
     Composite c = getParent();
     c.setLayout(new GridLayout(1, false));
 
     Label info = new Label(c, SWT.WRAP);
-    info.setText("Hikvision-Benutzergruppen mit Anzahl Mitglieder (aus dem letzten Cache-Stand). "
+    info.setText("Zugangssystem-Benutzergruppen mit Anzahl Mitglieder (aus dem letzten Cache-Stand). "
         + "Über die Benutzer-Sicht 'Aktualisieren' klicken um die Daten neu vom Controller zu laden.");
     GridData igd = new GridData(SWT.FILL, SWT.CENTER, true, false);
     igd.widthHint = 800;
@@ -52,6 +52,7 @@ public class HikvisionGruppenView extends AbstractView
     TableColumn c1 = new TableColumn(table, SWT.LEFT); c1.setText("Gruppe");        c1.setWidth(220);
     TableColumn c2 = new TableColumn(table, SWT.RIGHT); c2.setText("Benutzer");      c2.setWidth(90);
     TableColumn c3 = new TableColumn(table, SWT.LEFT); c3.setText("UUID");           c3.setWidth(380);
+    TableSorter.install(table);
 
     for (HikvisionGroupCatalog.Group g : cat.groups)
     {

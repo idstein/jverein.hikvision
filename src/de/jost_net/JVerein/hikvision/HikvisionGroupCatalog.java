@@ -49,9 +49,12 @@ public class HikvisionGroupCatalog
   public static class RegionPermissionGroup
   {
     public final int id;
+    public String name = "";   // looked up from UserRightPlanTemplate when available
     public int memberCount;
     RegionPermissionGroup(int id) { this.id = id; }
-    @Override public String toString() { return "Region " + id + " (" + memberCount + " Benutzer)"; }
+    public String displayName()
+    { return (name == null || name.isEmpty()) ? ("Region " + id) : name; }
+    @Override public String toString() { return displayName() + " (" + memberCount + " Benutzer)"; }
   }
 
   public final List<Group> groups = new ArrayList<>();
@@ -94,6 +97,7 @@ public class HikvisionGroupCatalog
           JSONObject r = rs.getJSONObject(i);
           RegionPermissionGroup rr = new RegionPermissionGroup(r.optInt("id"));
           rr.memberCount = r.optInt("memberCount", 0);
+          rr.name = r.optString("name", "");
           c.regions.add(rr);
         }
         return c;
@@ -119,7 +123,9 @@ public class HikvisionGroupCatalog
                                .put("memberCount", g.memberCount));
       JSONArray rs = new JSONArray();
       for (RegionPermissionGroup r : c.regions)
-        rs.put(new JSONObject().put("id", r.id).put("memberCount", r.memberCount));
+        rs.put(new JSONObject().put("id", r.id)
+                               .put("memberCount", r.memberCount)
+                               .put("name", r.name == null ? "" : r.name));
       JSONObject root = new JSONObject().put("timestamp", c.timestamp)
                                         .put("groups", gs).put("regions", rs);
       File tmp = new File(f.getParentFile(), f.getName() + ".tmp");
@@ -189,15 +195,35 @@ public class HikvisionGroupCatalog
     return c;
   }
 
-  /** Lightweight Settings-side fetch: UserInfo only, no CardInfo, no jverein
-   *  DB scan, no PlanCache write. Saves the result to the dedicated
-   *  HikvisionGroups.json so the next Settings open shows dropdowns. */
+  /** Lightweight Settings-side fetch: UserInfo + UserRightPlanTemplate
+   *  names. No CardInfo, no jverein DB scan, no PlanCache write. */
   public static HikvisionGroupCatalog refreshFromHikvision(HikvisionClient client, ProgressListener pl) throws IOException
   {
     JSONArray users = client.listAllUsers(pl);
     HikvisionGroupCatalog c = fromUsers(users, System.currentTimeMillis());
+    annotateRegionNames(c, client, pl);
     save(c);
     return c;
+  }
+
+  /** Look up UserRightPlanTemplate names and apply to the catalog's regions.
+   *  Best-effort — controller may not expose this on all firmwares. */
+  public static void annotateRegionNames(HikvisionGroupCatalog c, HikvisionClient client, ProgressListener pl)
+  {
+    try
+    {
+      java.util.Map<Integer, String> names = client.listRightPlanTemplateNames();
+      for (RegionPermissionGroup r : c.regions)
+      {
+        String n = names.get(r.id);
+        if (n != null && !n.isEmpty()) r.name = n;
+      }
+    }
+    catch (Exception e)
+    {
+      Logger.warn("UserRightPlanTemplate lookup failed (Region-Namen bleiben numerisch): " + e.getMessage());
+      if (pl != null) pl.log("UserRightPlanTemplate-Lookup nicht verfügbar — Region-Namen bleiben numerisch.");
+    }
   }
 
   private static String safe(String s) { return s == null ? "" : s; }

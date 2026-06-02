@@ -26,16 +26,14 @@ public class HikvisionRechteView extends AbstractView
   @Override
   public void bind() throws Exception
   {
-    GUI.getView().setTitle("Hikvision Türrechte");
+    GUI.getView().setTitle("Zugangssystem Türrechte");
     Composite c = getParent();
     c.setLayout(new GridLayout(1, false));
 
     Label info = new Label(c, SWT.WRAP);
-    info.setText("Region-Permission-Gruppen (Türrechte) in Verwendung. Hikvision DS-K Firmware "
-        + "stellt für diese keinen Namen-Lookup via ISAPI bereit — benannte Rechte gibt es nur "
-        + "über das Web-UI des Controllers. Wenn eine Gruppe wie 'Vorstand' oder 'Robby Bubble' "
-        + "in der Benutzer-Sicht erscheint, ordnet der Controller die einer dieser numerischen "
-        + "Region-IDs zu.");
+    info.setText("Region-Permission-Gruppen (Türrechte) in Verwendung. Namen werden — sofern "
+        + "verfügbar — aus dem UserRightPlanTemplate des Controllers gelesen; Regionen ohne "
+        + "Template-Namen werden als 'Region N' angezeigt.");
     GridData igd = new GridData(SWT.FILL, SWT.CENTER, true, false);
     igd.widthHint = 800;
     info.setLayoutData(igd);
@@ -52,28 +50,17 @@ public class HikvisionRechteView extends AbstractView
     tgd.heightHint = 360; tgd.widthHint = 760;
     table.setLayoutData(tgd);
 
-    TableColumn c1 = new TableColumn(table, SWT.RIGHT); c1.setText("Region-ID");   c1.setWidth(110);
-    TableColumn c2 = new TableColumn(table, SWT.RIGHT); c2.setText("Benutzer");    c2.setWidth(110);
-    TableColumn c3 = new TableColumn(table, SWT.LEFT);  c3.setText("Hinweis");     c3.setWidth(420);
+    TableColumn c1 = new TableColumn(table, SWT.RIGHT); c1.setText("Region-ID");   c1.setWidth(90);
+    TableColumn c2 = new TableColumn(table, SWT.LEFT);  c2.setText("Name");         c2.setWidth(240);
+    TableColumn c3 = new TableColumn(table, SWT.RIGHT); c3.setText("Benutzer");     c3.setWidth(100);
+    TableSorter.install(table);
 
     for (HikvisionGroupCatalog.RegionPermissionGroup g : cat.regions)
     {
       TableItem ti = new TableItem(table, SWT.NONE);
       ti.setText(0, String.valueOf(g.id));
-      ti.setText(1, String.valueOf(g.memberCount));
-      ti.setText(2, hint(g.id));
-    }
-  }
-
-  private static String hint(int id)
-  {
-    // Best-effort label based on the typical Hikvision DS-K convention.
-    switch (id)
-    {
-      case 1: return "üblicherweise: Standard / alle Türen tagsüber";
-      case 2: return "";
-      case 3: return "üblicherweise: Mitglieder (Sport-Öffnungszeiten)";
-      default: return "";
+      ti.setText(1, g.name == null || g.name.isEmpty() ? "(unbenannt)" : g.name);
+      ti.setText(2, String.valueOf(g.memberCount));
     }
   }
 

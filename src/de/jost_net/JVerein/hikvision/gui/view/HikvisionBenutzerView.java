@@ -56,7 +56,7 @@ public class HikvisionBenutzerView extends AbstractView
   @Override
   public void bind() throws Exception
   {
-    GUI.getView().setTitle("Hikvision Benutzer");
+    GUI.getView().setTitle("Zugangssystem Benutzer");
     Composite parent = getParent();
     parent.setLayout(new GridLayout(2, false));
     Composite c = parent;
@@ -114,6 +114,7 @@ public class HikvisionBenutzerView extends AbstractView
       TableColumn tc = new TableColumn(table, SWT.LEFT);
       tc.setText(col[0]); tc.setWidth(Integer.parseInt(col[1]));
     }
+    TableSorter.install(table);
 
     // --- action row: dry-run + Sync + Import ---
     Composite actionRow = new Composite(c, SWT.NONE);
@@ -236,7 +237,7 @@ public class HikvisionBenutzerView extends AbstractView
   private void onRefresh()
   {
     final boolean dry = dryRunCheckbox.getSelection();
-    startTask("Hikvision Aktualisierung", dry, (task, mon) -> {
+    startTask("Zugangssystem Aktualisierung", dry, (task, mon) -> {
       ChipStore chips = ChipStore.defaultStore();
       HikvisionClient client = new HikvisionClient(
           HikvisionSettings.getControllerUrl(), HikvisionSettings.getControllerUser(),
@@ -255,7 +256,7 @@ public class HikvisionBenutzerView extends AbstractView
   private void onSync()
   {
     final boolean dry = dryRunCheckbox.getSelection();   // UI thread — capture before submitting
-    startTask("Hikvision Sync", dry, (task, mon) -> {
+    startTask("Zugangssystem Sync", dry, (task, mon) -> {
       SyncEngine.Result r = SyncEngine.run(dry, listener(task, mon));
       log("\nFertig (Sync). created=" + r.created + " deleted=" + r.deleted
           + " cardsAdded=" + r.cardsAdded + " cardsRemoved=" + r.cardsRemoved
@@ -272,7 +273,7 @@ public class HikvisionBenutzerView extends AbstractView
         "Dieser Vorgang überschreibt die transponder-Zusatzfelder aller passenden jverein-Mitglieder "
         + "mit den Werten aus dem Zutrittssystem. Wirklich fortfahren?"))
       return;
-    startTask("Hikvision Import", dry, (task, mon) -> {
+    startTask("Zugangssystem Import", dry, (task, mon) -> {
       SyncEngine.ImportResult r = SyncEngine.importFromHikvision(dry, listener(task, mon));
       log("\nFertig (Import). updated=" + r.membersUpdated + " unchanged=" + r.membersUnchanged
           + " hikUnmatched=" + r.hikvisionUsersUnmatched + " errors=" + r.errors.size() + "\n");

@@ -40,7 +40,7 @@ public class HikvisionChipsView extends AbstractView
   @Override
   public void bind() throws Exception
   {
-    GUI.getView().setTitle("Hikvision Chips");
+    GUI.getView().setTitle("Zugangssystem Chips");
     try { store = ChipStore.defaultStore(); }
     catch (Exception e)
     {
@@ -69,6 +69,7 @@ public class HikvisionChipsView extends AbstractView
     table.setLayoutData(tgd);
     TableColumn c1 = new TableColumn(table, SWT.LEFT); c1.setText("Chip"); c1.setWidth(180);
     TableColumn c2 = new TableColumn(table, SWT.LEFT); c2.setText("Kartennummer"); c2.setWidth(240);
+    TableSorter.install(table);
     refresh();
     table.addSelectionListener(new SelectionAdapter() {
       @Override public void widgetDefaultSelected(SelectionEvent e) { onEdit(); }

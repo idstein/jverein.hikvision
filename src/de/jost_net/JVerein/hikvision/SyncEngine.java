@@ -301,7 +301,9 @@ public class SyncEngine
     // Also refresh the standalone catalog so the Settings dropdowns are up
     // to date — they read from HikvisionGroups.json (the lighter file) not
     // from PlanCache.
-    HikvisionGroupCatalog.save(HikvisionGroupCatalog.fromPlan(plan, System.currentTimeMillis()));
+    HikvisionGroupCatalog cat = HikvisionGroupCatalog.fromPlan(plan, System.currentTimeMillis());
+    HikvisionGroupCatalog.annotateRegionNames(cat, client, pl);
+    HikvisionGroupCatalog.save(cat);
     return plan;
   }
 

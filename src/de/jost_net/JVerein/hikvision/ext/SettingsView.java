@@ -103,7 +103,7 @@ public class SettingsView implements Extension
 
   private void buildTab(Settings settings) throws Exception
   {
-    tab = new TabGroup(settings.getTabFolder(), "Hikvision");
+    tab = new TabGroup(settings.getTabFolder(), "Zugangssystem");
     tab.getComposite().addDisposeListener(new DisposeListener() {
       @Override public void widgetDisposed(DisposeEvent e)
       { Application.getMessagingFactory().unRegisterMessageConsumer(consumer); }
