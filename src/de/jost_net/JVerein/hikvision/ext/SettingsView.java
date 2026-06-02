@@ -204,10 +204,17 @@ public class SettingsView implements Extension
   private void onTest()
   {
     testBtn.setEnabled(false);
+    try { persistConnectionFields(); }  // must run on the UI thread — reads SWT inputs
+    catch (Exception e)
+    {
+      Logger.error("Test connection: read settings failed", e);
+      showError("Verbindung fehlgeschlagen", e.getClass().getSimpleName() + ": " + e.getMessage());
+      testBtn.setEnabled(true);
+      return;
+    }
     Thread t = new Thread(() -> {
       try
       {
-        persistConnectionFields();
         HikvisionClient client = currentClient();
         String xml = client.getDeviceInfoXml();
         String model = xtract(xml, "model");
@@ -239,13 +246,19 @@ public class SettingsView implements Extension
   {
     fetchBtn.setEnabled(false);
     testBtn.setEnabled(false);
-    Display.getDefault().asyncExec(() -> {
-      if (statusLabel != null) statusLabel.setValue("lädt UserInfo + CardInfo …");
-    });
+    try { persistConnectionFields(); }  // must run on the UI thread — reads SWT inputs
+    catch (Exception e)
+    {
+      Logger.error("Fetch: read settings failed", e);
+      showError("Laden fehlgeschlagen", e.getClass().getSimpleName() + ": " + e.getMessage());
+      fetchBtn.setEnabled(true);
+      testBtn.setEnabled(true);
+      return;
+    }
+    if (statusLabel != null) statusLabel.setValue("lädt UserInfo + CardInfo …");
     Thread t = new Thread(() -> {
       try
       {
-        persistConnectionFields();
         de.jost_net.JVerein.hikvision.ChipStore chipStore =
             de.jost_net.JVerein.hikvision.ChipStore.defaultStore();
         SyncEngine.Plan plan = SyncEngine.computePlan(chipStore, currentClient(), new ProgressListener() {
