@@ -379,13 +379,13 @@ public class HikvisionBenutzerView extends AbstractView
 
   private boolean confirm(String title, String msg)
   {
-    MessageBox b = new MessageBox(Display.getDefault().getActiveShell(), SWT.ICON_WARNING | SWT.YES | SWT.NO);
+    MessageBox b = new MessageBox(GUI.getShell(), SWT.ICON_WARNING | SWT.YES | SWT.NO);
     b.setText(title); b.setMessage(msg); return b.open() == SWT.YES;
   }
   private void error(String title, String msg)
-  { MessageBox b = new MessageBox(Display.getDefault().getActiveShell(), SWT.ICON_ERROR | SWT.OK);
+  { MessageBox b = new MessageBox(GUI.getShell(), SWT.ICON_ERROR | SWT.OK);
     b.setText(title); b.setMessage(msg); b.open(); }
   private void info(String title, String msg)
-  { MessageBox b = new MessageBox(Display.getDefault().getActiveShell(), SWT.ICON_INFORMATION | SWT.OK);
+  { MessageBox b = new MessageBox(GUI.getShell(), SWT.ICON_INFORMATION | SWT.OK);
     b.setText(title); b.setMessage(msg); b.open(); }
 }

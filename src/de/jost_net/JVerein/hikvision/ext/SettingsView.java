@@ -23,6 +23,7 @@ import de.jost_net.JVerein.hikvision.HikvisionSettings;
 import de.jost_net.JVerein.hikvision.PlanCache;
 import de.jost_net.JVerein.hikvision.ProgressListener;
 import de.jost_net.JVerein.hikvision.SyncEngine;
+import de.willuhn.jameica.gui.GUI;
 import de.willuhn.jameica.gui.extension.Extendable;
 import de.willuhn.jameica.gui.extension.Extension;
 import de.willuhn.jameica.gui.input.CheckboxInput;
@@ -396,14 +397,14 @@ public class SettingsView implements Extension
   private void showError(String title, String message)
   {
     Display.getDefault().asyncExec(() -> {
-      MessageBox box = new MessageBox(Display.getDefault().getActiveShell(), SWT.ICON_ERROR | SWT.OK);
+      MessageBox box = new MessageBox(GUI.getShell(), SWT.ICON_ERROR | SWT.OK);
       box.setText(title); box.setMessage(message); box.open();
     });
   }
   private void showInfo(String title, String message)
   {
     Display.getDefault().asyncExec(() -> {
-      MessageBox box = new MessageBox(Display.getDefault().getActiveShell(), SWT.ICON_INFORMATION | SWT.OK);
+      MessageBox box = new MessageBox(GUI.getShell(), SWT.ICON_INFORMATION | SWT.OK);
       box.setText(title); box.setMessage(message); box.open();
     });
   }

@@ -112,7 +112,7 @@ public class HikvisionChipsView extends AbstractView
 
   private void onAdd()
   {
-    String[] vals = ChipEditDialog.open(Display.getDefault().getActiveShell(), "Transponder hinzufügen", "", "");
+    String[] vals = ChipEditDialog.open(GUI.getShell(), "Transponder hinzufügen", "", "");
     if (vals == null) return;
     try { store.put(vals[0], vals[1]); store.save(); refresh(); }
     catch (Exception e) { err("Hinzufügen fehlgeschlagen", e.getMessage()); }
@@ -123,7 +123,7 @@ public class HikvisionChipsView extends AbstractView
     int idx = table.getSelectionIndex(); if (idx < 0) return;
     TableItem ti = table.getItem(idx);
     String oldChip = ti.getText(0), oldCard = ti.getText(1);
-    String[] vals = ChipEditDialog.open(Display.getDefault().getActiveShell(), "Transponder bearbeiten", oldChip, oldCard);
+    String[] vals = ChipEditDialog.open(GUI.getShell(), "Transponder bearbeiten", oldChip, oldCard);
     if (vals == null) return;
     try
     {
@@ -144,7 +144,7 @@ public class HikvisionChipsView extends AbstractView
 
   private void onImport()
   {
-    FileDialog fd = new FileDialog(Display.getDefault().getActiveShell(), SWT.OPEN);
+    FileDialog fd = new FileDialog(GUI.getShell(), SWT.OPEN);
     fd.setText("Transponder-CSV importieren");
     fd.setFilterExtensions(new String[] { "*.csv", "*.*" });
     String path = fd.open(); if (path == null) return;
@@ -160,7 +160,7 @@ public class HikvisionChipsView extends AbstractView
 
   private void onExport()
   {
-    FileDialog fd = new FileDialog(Display.getDefault().getActiveShell(), SWT.SAVE);
+    FileDialog fd = new FileDialog(GUI.getShell(), SWT.SAVE);
     fd.setText("Transponder-CSV exportieren"); fd.setFileName("chip_kartennummer.csv");
     fd.setFilterExtensions(new String[] { "*.csv", "*.*" });
     String path = fd.open(); if (path == null) return;
@@ -169,12 +169,12 @@ public class HikvisionChipsView extends AbstractView
   }
 
   private boolean confirm(String t, String m)
-  { MessageBox b = new MessageBox(Display.getDefault().getActiveShell(), SWT.ICON_WARNING | SWT.YES | SWT.NO);
+  { MessageBox b = new MessageBox(GUI.getShell(), SWT.ICON_WARNING | SWT.YES | SWT.NO);
     b.setText(t); b.setMessage(m); return b.open() == SWT.YES; }
   private void err(String t, String m)
-  { MessageBox b = new MessageBox(Display.getDefault().getActiveShell(), SWT.ICON_ERROR | SWT.OK);
+  { MessageBox b = new MessageBox(GUI.getShell(), SWT.ICON_ERROR | SWT.OK);
     b.setText(t); b.setMessage(m); b.open(); }
   private void info(String t, String m)
-  { MessageBox b = new MessageBox(Display.getDefault().getActiveShell(), SWT.ICON_INFORMATION | SWT.OK);
+  { MessageBox b = new MessageBox(GUI.getShell(), SWT.ICON_INFORMATION | SWT.OK);
     b.setText(t); b.setMessage(m); b.open(); }
 }
