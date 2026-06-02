@@ -30,6 +30,15 @@ Hikvision entries the plugin does **not** manage (e.g. `SKM0000NNN`
 admin/loaner entries, anything not int-parseable and not `G`-prefixed) are
 left strictly alone — never touched, never deleted.
 
+## Requires
+
+- **Jameica 2.10+ with JVerein 3.1+ installed.** That's it on the jVerein
+  side — this plugin runs inside Jameica and talks to JVerein's database
+  directly via `Einstellungen.getDBService()`. **No HTTP / REST is used
+  for the jVerein side**, so `jverein.rest` is *not* a dependency.
+- A reachable Hikvision DS-K-series access controller with ISAPI enabled
+  (tested against DS-K2702WX-E1(P) firmware V1.7.4).
+
 ## Install
 
 1. Download the latest plugin zip from `releases/nightly/` (or build it
