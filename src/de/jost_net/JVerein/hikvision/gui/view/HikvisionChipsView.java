@@ -107,6 +107,7 @@ public class HikvisionChipsView extends AbstractView
       TableItem ti = new TableItem(table, SWT.NONE);
       ti.setText(0, row[0]); ti.setText(1, row[1]);
     }
+    TableSorter.reapplyIfSorted(table);
   }
 
   private void onAdd()

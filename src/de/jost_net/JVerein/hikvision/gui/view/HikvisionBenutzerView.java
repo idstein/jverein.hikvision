@@ -216,6 +216,9 @@ public class HikvisionBenutzerView extends AbstractView
       ti.setText(6, String.join(",", r.desiredCards));
       ti.setText(7, r.detail == null ? "" : r.detail);
     }
+    // Preserve the user's column sort across filter / refresh — without this
+    // the table header keeps the ↑/↓ indicator but the rows are unsorted.
+    TableSorter.reapplyIfSorted(table);
   }
 
   private static String statusLabel(SyncEngine.Status s)

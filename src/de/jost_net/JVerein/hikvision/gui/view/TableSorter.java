@@ -43,6 +43,24 @@ public final class TableSorter
     }
   }
 
+  /**
+   * Re-apply the table's currently set sort (sortColumn + sortDirection) to
+   * the items it now holds. Call this after wiping + repopulating a table
+   * so a previously active sort survives (filter changes, refreshes, etc.).
+   * No-op if no sort is set.
+   */
+  public static void reapplyIfSorted(Table table)
+  {
+    TableColumn sortCol = table.getSortColumn();
+    int dir = table.getSortDirection();
+    if (sortCol == null || (dir != SWT.UP && dir != SWT.DOWN)) return;
+    int col = -1;
+    for (int i = 0; i < table.getColumnCount(); i++)
+      if (table.getColumn(i) == sortCol) { col = i; break; }
+    if (col < 0) return;
+    sort(table, col, dir);
+  }
+
   private static void sort(Table table, int col, int dir)
   {
     TableItem[] items = table.getItems();
