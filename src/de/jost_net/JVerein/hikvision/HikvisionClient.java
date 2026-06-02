@@ -3,6 +3,7 @@ package de.jost_net.JVerein.hikvision;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
+import java.io.InterruptedIOException;
 import java.io.OutputStream;
 import java.net.HttpURLConnection;
 import java.net.URL;
@@ -239,6 +240,8 @@ public class HikvisionClient
       Logger.info("Hikvision UserInfo/Search pos=" + pos + " got=" + got + " total=" + total);
       if (pl != null) pl.progress(out.length(), total, "Benutzer abrufen");
       if (got == 0 || out.length() >= total) break;
+      if (pl != null && pl.isCancelled())
+        throw new InterruptedIOException("Abgebrochen nach " + out.length() + "/" + total + " Benutzern");
       pos += got;
       pace();
     }
@@ -267,6 +270,8 @@ public class HikvisionClient
       Logger.info("Hikvision CardInfo/Search pos=" + pos + " got=" + got + " total=" + total);
       if (pl != null) pl.progress(out.length(), total, "Karten abrufen");
       if (got == 0 || out.length() >= total) break;
+      if (pl != null && pl.isCancelled())
+        throw new InterruptedIOException("Abgebrochen nach " + out.length() + "/" + total + " Karten");
       pos += got;
       pace();
     }

@@ -3,7 +3,7 @@
 <plugin xmlns="http://www.willuhn.de/schema/jameica-plugin"
         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
         xsi:schemaLocation="http://www.willuhn.de/schema/jameica-plugin http://www.willuhn.de/schema/jameica-plugin-1.5.xsd"
-        name="jverein.hikvision" version="0.7.0" class="de.jost_net.JVerein.hikvision.Plugin">
+        name="jverein.hikvision" version="0.7.1" class="de.jost_net.JVerein.hikvision.Plugin">
 
   <description>Synchronisiert jVerein-Mitglieder mit Hikvision Zutrittssystem (DS-K2702WX und ähnlich) via ISAPI</description>
   <url>https://github.com/idstein/jverein.hikvision</url>

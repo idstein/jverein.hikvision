@@ -18,4 +18,15 @@ public interface ProgressListener
   {
     progress(done, total);
   }
+
+  /**
+   * Returns {@code true} if the surrounding background task has been
+   * cancelled. Long-running loops (HikvisionClient pagination,
+   * SyncEngine.run apply phase) should check this between iterations
+   * and throw {@link java.io.InterruptedIOException} when set, so the
+   * cancel button in Jameica's status bar takes effect promptly.
+   * Default is {@code false} so non-cancellable callers don't need to
+   * implement it.
+   */
+  default boolean isCancelled() { return false; }
 }

@@ -216,9 +216,9 @@ public class SettingsView implements Extension
 
   private void onSyncClick()
   {
-    startTabTask("Hikvision Sync", "Sync gestartet", mon -> {
+    startTabTask("Hikvision Sync", "Sync gestartet", (task, mon) -> {
       storeConfig();
-      SyncEngine.Result r = SyncEngine.run(isDryRun(), syncTabListener(mon));
+      SyncEngine.Result r = SyncEngine.run(isDryRun(), syncTabListener(task, mon));
       appendLog("\nFertig (Sync). created=" + r.created + " deleted=" + r.deleted
           + " cardsAdded=" + r.cardsAdded + " cardsRemoved=" + r.cardsRemoved
           + " skipped=" + r.skippedMembers + " unknownCards=" + r.unknownCards
@@ -236,9 +236,9 @@ public class SettingsView implements Extension
         + "passenden jverein-Mitglieder mit den Werten aus dem "
         + "Zutrittssystem. Wirklich fortfahren?"))
       return;
-    startTabTask("Hikvision Import", "Import gestartet", mon -> {
+    startTabTask("Hikvision Import", "Import gestartet", (task, mon) -> {
       storeConfig();
-      SyncEngine.ImportResult r = SyncEngine.importFromHikvision(isDryRun(), syncTabListener(mon));
+      SyncEngine.ImportResult r = SyncEngine.importFromHikvision(isDryRun(), syncTabListener(task, mon));
       appendLog("\nFertig (Import). updated=" + r.membersUpdated
           + " unchanged=" + r.membersUnchanged
           + " hikUnmatched=" + r.hikvisionUsersUnmatched
@@ -252,13 +252,16 @@ public class SettingsView implements Extension
   @FunctionalInterface
   private interface MonitoredTask
   {
-    void run(ProgressMonitor mon) throws Exception;
+    void run(BackgroundTask task, ProgressMonitor mon) throws Exception;
   }
 
   /**
    * Submit a task to Jameica's BackgroundTask queue. The global status bar
    * shows the progress (and a cancel button). The in-tab ProgressBar
    * receives the same updates via {@link #syncTabListener}.
+   *
+   * Catches {@link java.io.InterruptedIOException} as a cancel (not an
+   * error) — surfaces as STATUS_CANCEL in the status bar.
    */
   private void startTabTask(String taskName, String startMsg, MonitoredTask body)
   {
@@ -279,9 +282,16 @@ public class SettingsView implements Extension
         try
         {
           monitor.setStatusText(taskName + " läuft …");
-          body.run(monitor);
+          body.run(this, monitor);
           monitor.setStatus(ProgressMonitor.STATUS_DONE);
           monitor.setPercentComplete(100);
+        }
+        catch (java.io.InterruptedIOException ie)
+        {
+          Logger.info(taskName + " cancelled by user");
+          appendLog("\nABGEBROCHEN: " + ie.getMessage() + "\n");
+          monitor.log("Abgebrochen: " + ie.getMessage());
+          monitor.setStatus(ProgressMonitor.STATUS_CANCEL);
         }
         catch (Exception e)
         {
@@ -310,7 +320,7 @@ public class SettingsView implements Extension
    * sync tab. The Jameica monitor is the canonical place — the in-tab bar
    * is a supplemental at-a-glance indicator next to the button.
    */
-  private SyncEngine.ProgressListener syncTabListener(ProgressMonitor mon)
+  private SyncEngine.ProgressListener syncTabListener(BackgroundTask task, ProgressMonitor mon)
   {
     return new SyncEngine.ProgressListener()
     {
@@ -339,6 +349,7 @@ public class SettingsView implements Extension
             syncProgressLabel.setText(phase + "  " + done + " / " + total);
         });
       }
+      @Override public boolean isCancelled() { return task != null && task.isInterrupted(); }
     };
   }
 
@@ -687,7 +698,7 @@ public class SettingsView implements Extension
               HikvisionSettings.getControllerUrl(), HikvisionSettings.getControllerUser(),
               HikvisionSettings.getControllerPassword(), HikvisionSettings.getInterCallPauseMs());
 
-          SyncEngine.Plan plan = SyncEngine.computePlan(chipStore, client, usersTabListener(monitor));
+          SyncEngine.Plan plan = SyncEngine.computePlan(chipStore, client, usersTabListener(this, monitor));
 
           currentPlanRows = plan.rows;
           final String summary = plan.rows.size() + " Einträge — "
@@ -702,6 +713,16 @@ public class SettingsView implements Extension
           });
           monitor.setStatus(ProgressMonitor.STATUS_DONE);
           monitor.setPercentComplete(100);
+        }
+        catch (java.io.InterruptedIOException ie)
+        {
+          Logger.info("user refresh cancelled by user");
+          Display.getDefault().asyncExec(() -> {
+            if (usersCount != null && !usersCount.isDisposed())
+              usersCount.setText("Abgebrochen: " + ie.getMessage());
+          });
+          monitor.log("Abgebrochen: " + ie.getMessage());
+          monitor.setStatus(ProgressMonitor.STATUS_CANCEL);
         }
         catch (Exception e)
         {
@@ -726,7 +747,7 @@ public class SettingsView implements Extension
   }
 
   /** Listener that drives Jameica's status bar AND the Benutzer-tab ProgressBar. */
-  private SyncEngine.ProgressListener usersTabListener(ProgressMonitor mon)
+  private SyncEngine.ProgressListener usersTabListener(BackgroundTask task, ProgressMonitor mon)
   {
     return new SyncEngine.ProgressListener()
     {
@@ -751,6 +772,7 @@ public class SettingsView implements Extension
             usersCount.setText(phase + "  " + done + " / " + total + " …");
         });
       }
+      @Override public boolean isCancelled() { return task != null && task.isInterrupted(); }
     };
   }
 

@@ -422,6 +422,7 @@ public class SyncEngine
     // --- create ---
     for (String emp : new ArrayList<>(toCreate))
     {
+      if (pl.isCancelled()) throw new java.io.InterruptedIOException("Abgebrochen nach " + done + "/" + total);
       Desired d = desired.get(emp);
       pl.log("CREATE " + emp + " " + d.name + "  cards=" + d.cardNos);
       if (!dryRun)
@@ -449,6 +450,7 @@ public class SyncEngine
     // --- delete ---
     for (String emp : new ArrayList<>(toDelete))
     {
+      if (pl.isCancelled()) throw new java.io.InterruptedIOException("Abgebrochen nach " + done + "/" + total);
       Actual a = actual.get(emp);
       pl.log("DELETE " + emp + " " + a.name + "  cards=" + a.cardNos);
       if (!dryRun)
@@ -469,6 +471,7 @@ public class SyncEngine
     // --- card diff in overlap (note: name/type/group changes NOT handled here) ---
     for (String emp : new ArrayList<>(overlap))
     {
+      if (pl.isCancelled()) throw new java.io.InterruptedIOException("Abgebrochen nach " + done + "/" + total);
       Desired d = desired.get(emp);
       Actual a = actual.get(emp);
       Set<String> add = new HashSet<>(d.cardNos); add.removeAll(a.cardNos);
@@ -578,9 +581,10 @@ public class SyncEngine
     int total = users.length(), done = 0;
     for (int i = 0; i < users.length(); i++)
     {
+      if (pl.isCancelled()) throw new java.io.InterruptedIOException("Abgebrochen nach " + done + "/" + total);
       JSONObject u = users.getJSONObject(i);
       String emp = u.optString("employeeNo");
-      done++; pl.progress(done, total);
+      done++; pl.progress(done, total, "Import läuft");
 
       if (!Identity.isManaged(emp)) continue;
 
