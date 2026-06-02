@@ -73,6 +73,219 @@ public class SyncEngine
     public boolean dryRun;
   }
 
+  // ------------------------------------------------------------ Plan model
+
+  public enum Status
+  {
+    OK,         // in sync — no action
+    CREATE,     // new in jverein, would be created on Hikvision
+    UPDATE,     // cards differ — would be added/removed on Hikvision
+    DELETE,     // on Hikvision, jverein says it shouldn't be (austritt or removed)
+    HIK_ONLY    // on Hikvision with an unmanaged employeeNo (SKM* etc.) — never touched
+  }
+
+  public static class PlanRow
+  {
+    public String employeeNo;
+    public String name;
+    public String userType;
+    public String groupName;
+    public List<String> currentCards = new ArrayList<>();
+    public List<String> desiredCards = new ArrayList<>();
+    public Status status;
+    public String detail = "";   // human-readable hint (e.g. "neuer Chip", "austritt 2025-01-15")
+    public String jvereinName = "";
+  }
+
+  public static class Plan
+  {
+    public final List<PlanRow> rows = new ArrayList<>();
+    public int ok, create, update, delete, hikOnly;
+    public int unknownCards;
+    public int membersSkipped;
+  }
+
+  /**
+   * Compute the full sync plan WITHOUT touching anything. Used by both
+   * the dry-run preview in the "Hikvision Benutzer" tab AND by the actual
+   * apply path in {@link #run}. Result rows are stable for direct table
+   * rendering — each row is one Hikvision-side employeeNo OR one
+   * to-be-created jverein-side row.
+   */
+  public static Plan computePlan(ChipStore chips, HikvisionClient client,
+                                 ProgressListener pl) throws Exception
+  {
+    Plan plan = new Plan();
+
+    // Pre-resolve the Felddefinition
+    DBIterator<Felddefinition> defs = Einstellungen.getDBService().createList(Felddefinition.class);
+    defs.addFilter("name = ?", HikvisionSettings.getZusatzfeldName());
+    if (!defs.hasNext())
+      throw new IllegalStateException("Felddefinition '" + HikvisionSettings.getZusatzfeldName()
+          + "' nicht gefunden in jverein");
+    Felddefinition def = (Felddefinition) defs.next();
+    String defId = def.getID();
+
+    // Index jverein members: by externe (int-normalized) and by id (for G{id} sponsor lookup later)
+    Map<String, Mitglied> jvByExterne = new HashMap<>();
+    Map<String, Mitglied> jvById = new HashMap<>();
+    DBIterator<Mitglied> jvIt = Einstellungen.getDBService().createList(Mitglied.class);
+    while (jvIt.hasNext())
+    {
+      Mitglied m = (Mitglied) jvIt.next();
+      jvById.put(m.getID(), m);
+      String ext = m.getExterneMitgliedsnummer();
+      if (ext != null && !ext.trim().isEmpty())
+      {
+        try { jvByExterne.put(String.valueOf(Integer.parseInt(ext.trim())), m); }
+        catch (NumberFormatException ignored) { jvByExterne.put(ext.trim(), m); }
+      }
+    }
+    pl.log("jverein: " + jvById.size() + " Mitglieder geladen");
+
+    // Build desired (jverein) state — only active members with chips
+    Map<String, PlanRow> desired = new TreeMap<>();
+    for (Mitglied m : jvById.values())
+    {
+      Date austritt = m.getAustritt();
+      if (austritt != null) { plan.membersSkipped++; continue; }
+
+      String chipsRaw = readZusatzfeld(m.getID(), defId);
+      if (chipsRaw == null || chipsRaw.isEmpty() || chipsRaw.equals("0") || chipsRaw.equalsIgnoreCase("null"))
+      { plan.membersSkipped++; continue; }
+
+      List<String> desiredCards = new ArrayList<>();
+      for (String chip : chipsRaw.split(","))
+      {
+        String c = chip.trim(); if (c.isEmpty()) continue;
+        String cardNo = chips.cardForChip(c);
+        if (cardNo == null) { plan.unknownCards++; pl.log("WARN: chip '" + c + "' (jv_id=" + m.getID()
+            + " " + safe(m.getVorname()) + " " + safe(m.getName()) + ") nicht im ChipStore"); continue; }
+        desiredCards.add(cardNo);
+      }
+      if (desiredCards.isEmpty()) { plan.membersSkipped++; continue; }
+
+      Identity id = Identity.of(m);
+      PlanRow row = new PlanRow();
+      row.employeeNo = id.employeeNo;
+      row.name = (safe(m.getVorname()) + " " + safe(m.getName())).trim();
+      row.userType = id.isSponsor ? "visitor" : "normal";
+      row.groupName = id.isSponsor ? HikvisionSettings.getSponsorGroupName() : HikvisionSettings.getMemberGroupName();
+      row.desiredCards = desiredCards;
+      row.jvereinName = row.name;
+      desired.put(id.employeeNo, row);
+    }
+    pl.log("jverein: " + desired.size() + " Mitglieder mit Transponder-Wert");
+
+    // Pull Hikvision actual state
+    pl.log("Hikvision UserInfo abrufen…");
+    JSONArray users = client.listAllUsers();
+    pl.log("Hikvision CardInfo abrufen…");
+    JSONArray cards = client.listAllCards();
+
+    Map<String, List<String>> cardsByEmp = new HashMap<>();
+    for (int i = 0; i < cards.length(); i++)
+    {
+      JSONObject c = cards.getJSONObject(i);
+      cardsByEmp.computeIfAbsent(c.optString("employeeNo"), k -> new ArrayList<>()).add(c.optString("cardNo"));
+    }
+
+    Map<String, JSONObject> actualByEmp = new TreeMap<>();
+    for (int i = 0; i < users.length(); i++)
+    {
+      JSONObject u = users.getJSONObject(i);
+      actualByEmp.put(u.optString("employeeNo"), u);
+    }
+
+    // Walk every Hikvision entry first (so the table shows everything)
+    for (Map.Entry<String, JSONObject> e : actualByEmp.entrySet())
+    {
+      String emp = e.getKey();
+      JSONObject u = e.getValue();
+      List<String> cur = cardsByEmp.getOrDefault(emp, new ArrayList<>());
+
+      if (!Identity.isManaged(emp))
+      {
+        PlanRow row = new PlanRow();
+        row.employeeNo = emp;
+        row.name = u.optString("name", "");
+        row.userType = u.optString("userType", "");
+        row.groupName = u.optString("userGroupNodeName", "");
+        row.currentCards = cur;
+        row.status = Status.HIK_ONLY;
+        row.detail = "unverwalteter employeeNo (z.B. SKM*) — wird bei Sync nie angefasst";
+        plan.rows.add(row); plan.hikOnly++;
+        continue;
+      }
+
+      PlanRow d = desired.remove(emp);
+      if (d == null)
+      {
+        // Hikvision-managed entry with no jverein match → would delete
+        PlanRow row = new PlanRow();
+        row.employeeNo = emp;
+        row.name = u.optString("name", "");
+        row.userType = u.optString("userType", "");
+        row.groupName = u.optString("userGroupNodeName", "");
+        row.currentCards = cur;
+        row.status = Status.DELETE;
+
+        // Look up jverein member by emp (numeric ⇒ externe, G… ⇒ id)
+        Mitglied m = null;
+        if (emp.startsWith("G")) m = jvById.get(emp.substring(1));
+        else { try { m = jvByExterne.get(String.valueOf(Integer.parseInt(emp))); } catch (NumberFormatException nfe) {} }
+        if (m != null)
+        {
+          row.jvereinName = (safe(m.getVorname()) + " " + safe(m.getName())).trim();
+          Date austritt = m.getAustritt();
+          if (austritt != null) row.detail = "austritt " + austritt + " — Hikvision-Eintrag noch aktiv";
+          else row.detail = "jverein hat kein Transponder-Wert mehr für dieses Mitglied";
+        }
+        else
+        {
+          row.detail = "kein zugehöriges jverein-Mitglied — verwaister Eintrag";
+        }
+        plan.rows.add(row); plan.delete++;
+        continue;
+      }
+
+      // Both sides present — compare cards
+      d.currentCards = cur;
+      Set<String> add = new HashSet<>(d.desiredCards); add.removeAll(cur);
+      Set<String> rem = new HashSet<>(cur); rem.removeAll(d.desiredCards);
+      if (add.isEmpty() && rem.isEmpty())
+      {
+        d.status = Status.OK;
+        d.detail = "in sync";
+        plan.rows.add(d); plan.ok++;
+      }
+      else
+      {
+        d.status = Status.UPDATE;
+        StringBuilder det = new StringBuilder();
+        if (!add.isEmpty()) det.append("hinzu: ").append(String.join(",", add));
+        if (!rem.isEmpty()) { if (det.length() > 0) det.append("  "); det.append("entfernen: ").append(String.join(",", rem)); }
+        d.detail = det.toString();
+        plan.rows.add(d); plan.update++;
+      }
+    }
+
+    // Anything left in desired → not on Hikvision yet → CREATE
+    for (PlanRow row : desired.values())
+    {
+      row.status = Status.CREATE;
+      row.detail = "neu auf Hikvision anlegen";
+      plan.rows.add(row); plan.create++;
+    }
+
+    pl.log("Plan: ok=" + plan.ok + " neu=" + plan.create + " geändert=" + plan.update
+        + " löschen=" + plan.delete + " hik-only=" + plan.hikOnly
+        + " | übersprungen=" + plan.membersSkipped + " unbekannte Chips=" + plan.unknownCards);
+    return plan;
+  }
+
+  private static String safe(String s) { return s == null ? "" : s; }
+
   /**
    * Build desired state from jverein + ChipStore. Returns map: employeeNo -> Desired.
    */

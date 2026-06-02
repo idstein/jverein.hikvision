@@ -77,6 +77,8 @@ public class SettingsView implements Extension
   private Label usersCount;
   private Button refreshButton;
   private Button testButton;
+  private org.eclipse.swt.widgets.Combo filterCombo;
+  private java.util.List<SyncEngine.PlanRow> currentPlanRows = java.util.Collections.emptyList();
 
   private MessageConsumer consumer;
 
@@ -444,17 +446,17 @@ public class SettingsView implements Extension
     Composite c = tab.getComposite();
 
     Label info = new Label(c, SWT.WRAP);
-    info.setText("Read-only Übersicht der auf dem Hikvision-Controller registrierten "
-        + "Benutzer. \"Aktualisieren\" lädt UserInfo + CardInfo neu und vergleicht "
-        + "mit den in jverein vorhandenen Mitgliedern.");
+    info.setText("Diff-Übersicht: was würde der nächste Sync (jverein → Hikvision) tun? "
+        + "Filter unten links wählt die Aktion (alle / nur neu / nur geändert / nur löschen / "
+        + "nur unverwaltete Hikvision-Einträge / nur bereits in sync).");
     GridData infoGd = new GridData(SWT.FILL, SWT.CENTER, true, false, 2, 1);
-    infoGd.widthHint = 700;
+    infoGd.widthHint = 800;
     info.setLayoutData(infoGd);
 
     Composite btnRow = new Composite(c, SWT.NONE);
     GridData brGd = new GridData(SWT.FILL, SWT.CENTER, true, false, 2, 1);
     btnRow.setLayoutData(brGd);
-    btnRow.setLayout(new GridLayout(3, false));
+    btnRow.setLayout(new GridLayout(5, false));
 
     refreshButton = new Button(btnRow, SWT.PUSH);
     refreshButton.setText("Aktualisieren");
@@ -470,6 +472,17 @@ public class SettingsView implements Extension
       @Override public void widgetSelected(SelectionEvent e) { onTestConnection(); }
     });
 
+    new Label(btnRow, SWT.NONE).setText("Filter:");
+    filterCombo = new org.eclipse.swt.widgets.Combo(btnRow, SWT.READ_ONLY | SWT.DROP_DOWN);
+    filterCombo.setItems(new String[] {
+        "Alle", "Nur neu (CREATE)", "Nur geändert (UPDATE)", "Nur löschen (DELETE)",
+        "Nur unverwaltet (HIK_ONLY)", "Nur in sync (OK)" });
+    filterCombo.select(0);
+    filterCombo.setLayoutData(new GridData(SWT.FILL, SWT.CENTER, false, false));
+    filterCombo.addSelectionListener(new SelectionAdapter() {
+      @Override public void widgetSelected(SelectionEvent e) { renderPlanRows(); }
+    });
+
     usersCount = new Label(btnRow, SWT.NONE);
     usersCount.setText("(noch nicht abgerufen)");
     usersCount.setLayoutData(new GridData(SWT.FILL, SWT.CENTER, true, false));
@@ -478,13 +491,13 @@ public class SettingsView implements Extension
     usersTable.setHeaderVisible(true);
     usersTable.setLinesVisible(true);
     GridData tgd = new GridData(SWT.FILL, SWT.FILL, true, true, 2, 1);
-    tgd.heightHint = 420; tgd.widthHint = 900;
+    tgd.heightHint = 420; tgd.widthHint = 1000;
     usersTable.setLayoutData(tgd);
 
     String[][] cols = {
-        { "employeeNo", "110" }, { "Name", "180" }, { "Typ", "70" },
-        { "Gruppe", "120" }, { "#Karten", "60" }, { "Kartennummern", "200" },
-        { "Match", "80" }, { "jverein", "160" }
+        { "Status", "90" }, { "employeeNo", "100" }, { "Name", "170" },
+        { "Typ", "70" }, { "Gruppe", "100" },
+        { "Karten ist", "150" }, { "Karten soll", "150" }, { "Hinweis", "260" }
     };
     for (String[] col : cols)
     {
@@ -549,83 +562,26 @@ public class SettingsView implements Extension
       try
       {
         storeConfig();
+        ChipStore chipStore = ChipStore.defaultStore();
         HikvisionClient client = new HikvisionClient(
             HikvisionSettings.getControllerUrl(), HikvisionSettings.getControllerUser(),
             HikvisionSettings.getControllerPassword(), HikvisionSettings.getInterCallPauseMs());
-        JSONArray users = client.listAllUsers();
-        JSONArray cards = client.listAllCards();
 
-        // group cards by employeeNo
-        java.util.Map<String, java.util.List<String>> cardsByEmp = new java.util.HashMap<>();
-        for (int i = 0; i < cards.length(); i++)
+        SyncEngine.Plan plan = SyncEngine.computePlan(chipStore, client, new SyncEngine.ProgressListener()
         {
-          JSONObject co = cards.getJSONObject(i);
-          cardsByEmp.computeIfAbsent(co.optString("employeeNo"), k -> new java.util.ArrayList<>())
-              .add(co.optString("cardNo"));
-        }
+          @Override public void log(String msg) { Logger.info(msg); }
+          @Override public void progress(int done, int total) {}
+        });
 
-        // index jverein members for match column
-        java.util.Map<String, Mitglied> byExterne = new java.util.HashMap<>();
-        java.util.Map<String, Mitglied> byId = new java.util.HashMap<>();
-        DBIterator<Mitglied> it = Einstellungen.getDBService().createList(Mitglied.class);
-        while (it.hasNext())
-        {
-          Mitglied m = (Mitglied) it.next();
-          byId.put(m.getID(), m);
-          String ext = m.getExterneMitgliedsnummer();
-          if (ext != null && !ext.trim().isEmpty())
-          {
-            try { byExterne.put(String.valueOf(Integer.parseInt(ext.trim())), m); }
-            catch (NumberFormatException ignored) { byExterne.put(ext.trim(), m); }
-          }
-        }
+        currentPlanRows = plan.rows;
+        final String summary = plan.rows.size() + " Einträge — "
+            + plan.create + " neu, " + plan.update + " geändert, " + plan.delete + " löschen, "
+            + plan.hikOnly + " unverwaltet, " + plan.ok + " in sync"
+            + (plan.unknownCards > 0 ? "  (⚠ " + plan.unknownCards + " unbekannte Chips)" : "");
 
-        // assemble rows
-        java.util.List<String[]> rows = new java.util.ArrayList<>(users.length());
-        int matched = 0, sponsors = 0, unmanaged = 0;
-        for (int i = 0; i < users.length(); i++)
-        {
-          JSONObject u = users.getJSONObject(i);
-          String emp = u.optString("employeeNo");
-          String name = u.optString("name", "");
-          String type = u.optString("userType", "");
-          String grp = u.optString("userGroupNodeName", "");
-          java.util.List<String> uc = cardsByEmp.getOrDefault(emp, java.util.Collections.emptyList());
-
-          String match, jvName = "";
-          if (!Identity.isManaged(emp)) { match = "unverwaltet"; unmanaged++; }
-          else if (emp.startsWith("G"))
-          {
-            Mitglied m = byId.get(emp.substring(1));
-            if (m != null) { match = "Sponsor"; jvName = (m.getVorname() == null ? "" : m.getVorname()) + " " + (m.getName() == null ? "" : m.getName()); sponsors++; }
-            else { match = "Sponsor (?)"; unmanaged++; }
-          }
-          else
-          {
-            Mitglied m = null;
-            try { m = byExterne.get(String.valueOf(Integer.parseInt(emp))); }
-            catch (NumberFormatException nfe) { m = byExterne.get(emp); }
-            if (m != null) { match = "Mitglied"; jvName = (m.getVorname() == null ? "" : m.getVorname()) + " " + (m.getName() == null ? "" : m.getName()); matched++; }
-            else { match = "kein Match"; unmanaged++; }
-          }
-
-          rows.add(new String[] { emp, name, type, grp, String.valueOf(uc.size()),
-              String.join(",", uc), match, jvName.trim() });
-        }
-
-        final int fMatched = matched, fSponsors = sponsors, fUnmanaged = unmanaged;
-        final int fTotalUsers = users.length(), fTotalCards = cards.length();
         Display.getDefault().asyncExec(() -> {
-          if (usersTable == null || usersTable.isDisposed()) return;
-          usersTable.removeAll();
-          for (String[] r : rows)
-          {
-            TableItem ti = new TableItem(usersTable, SWT.NONE);
-            for (int k = 0; k < r.length; k++) ti.setText(k, r[k]);
-          }
-          if (usersCount != null && !usersCount.isDisposed())
-            usersCount.setText(fTotalUsers + " Benutzer, " + fTotalCards + " Karten — "
-                + fMatched + " Mitglied, " + fSponsors + " Sponsor, " + fUnmanaged + " unverwaltet");
+          if (usersCount != null && !usersCount.isDisposed()) usersCount.setText(summary);
+          renderPlanRows();
         });
       }
       catch (Exception e)
@@ -646,5 +602,60 @@ public class SettingsView implements Extension
     }, "jverein.hikvision-refresh");
     t.setDaemon(true);
     t.start();
+  }
+
+  /** Re-render the table from {@link #currentPlanRows} applying the filter dropdown. */
+  private void renderPlanRows()
+  {
+    if (usersTable == null || usersTable.isDisposed()) return;
+    usersTable.removeAll();
+    SyncEngine.Status wanted = null;
+    int sel = filterCombo == null ? 0 : filterCombo.getSelectionIndex();
+    switch (sel)
+    {
+      case 1: wanted = SyncEngine.Status.CREATE;   break;
+      case 2: wanted = SyncEngine.Status.UPDATE;   break;
+      case 3: wanted = SyncEngine.Status.DELETE;   break;
+      case 4: wanted = SyncEngine.Status.HIK_ONLY; break;
+      case 5: wanted = SyncEngine.Status.OK;       break;
+      default: wanted = null;                       break;
+    }
+    int shown = 0;
+    for (SyncEngine.PlanRow r : currentPlanRows)
+    {
+      if (wanted != null && r.status != wanted) continue;
+      TableItem ti = new TableItem(usersTable, SWT.NONE);
+      ti.setText(0, statusLabel(r.status));
+      ti.setText(1, r.employeeNo == null ? "" : r.employeeNo);
+      ti.setText(2, r.name == null ? "" : r.name);
+      ti.setText(3, r.userType == null ? "" : r.userType);
+      ti.setText(4, r.groupName == null ? "" : r.groupName);
+      ti.setText(5, String.join(",", r.currentCards));
+      ti.setText(6, String.join(",", r.desiredCards));
+      ti.setText(7, r.detail == null ? "" : r.detail);
+      shown++;
+    }
+    if (usersCount != null && !usersCount.isDisposed() && wanted != null)
+    {
+      String txt = usersCount.getText();
+      // append filtered count without losing the summary
+      int splitIdx = txt.indexOf("  (");
+      if (splitIdx > 0) txt = txt.substring(0, splitIdx);
+      usersCount.setText(txt + "  [Filter: " + shown + " sichtbar]");
+    }
+  }
+
+  private static String statusLabel(SyncEngine.Status s)
+  {
+    if (s == null) return "?";
+    switch (s)
+    {
+      case OK: return "OK";
+      case CREATE: return "NEU";
+      case UPDATE: return "GEÄNDERT";
+      case DELETE: return "LÖSCHEN";
+      case HIK_ONLY: return "HIK-ONLY";
+    }
+    return s.name();
   }
 }
