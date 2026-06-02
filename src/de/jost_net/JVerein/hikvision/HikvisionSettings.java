@@ -93,6 +93,14 @@ public class HikvisionSettings
   }
   public static void setDryRun(boolean b) { SETTINGS.setAttribute("sync.dryRun", b); }
 
+  /** When true, validate the controller's TLS certificate normally. When false,
+   *  accept any certificate (typical for self-signed Hikvision controllers). */
+  public static boolean getVerifySsl()
+  {
+    return SETTINGS.getBoolean("controller.verifySsl", false);
+  }
+  public static void setVerifySsl(boolean b) { SETTINGS.setAttribute("controller.verifySsl", b); }
+
   private static synchronized Wallet getWallet() throws Exception
   {
     if (wallet == null) wallet = new Wallet(HikvisionSettings.class);

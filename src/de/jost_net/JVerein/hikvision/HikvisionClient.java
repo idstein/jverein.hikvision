@@ -1,23 +1,21 @@
 package de.jost_net.JVerein.hikvision;
 
-import java.io.ByteArrayOutputStream;
 import java.io.IOException;
-import java.io.InputStream;
 import java.io.InterruptedIOException;
-import java.io.OutputStream;
-import java.net.HttpURLConnection;
-import java.net.URL;
+import java.net.URI;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.security.SecureRandom;
 import java.security.cert.X509Certificate;
+import java.time.Duration;
 import java.util.HashMap;
-import java.util.List;
 import java.util.Map;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
-import javax.net.ssl.HttpsURLConnection;
 import javax.net.ssl.SSLContext;
 import javax.net.ssl.TrustManager;
 import javax.net.ssl.X509TrustManager;
@@ -30,17 +28,20 @@ import de.willuhn.logging.Logger;
 /**
  * Hikvision DS-K2702WX ISAPI client.
  *
- * Implements HTTP Digest auth manually because the controller invalidates
- * the nonce after each request — a Java HttpClient that caches the
- * challenge would fail on the second call. Every request does a fresh
- * 401 → challenge → re-send dance.
+ * Uses {@link java.net.http.HttpClient} (Java 11+) instead of
+ * {@code HttpURLConnection} because Jameica installs a default
+ * {@link java.net.Authenticator} (for proxy / SSO concerns) which
+ * consumes the WWW-Authenticate header on a 401 before our code can
+ * read it — causing "no WWW-Authenticate header" errors on the first
+ * request to a digest-protected endpoint. {@code HttpClient} doesn't
+ * consult the default Authenticator, so the challenge stays visible.
  *
- * The self-signed controller cert is trusted unconditionally (this is a
- * LAN-only device behind digest auth).
+ * Hikvision controller quirk: the digest nonce is single-use; every
+ * request does a fresh 401 → challenge → re-send dance. Sharing or
+ * caching the nonce will get the 2nd call rejected.
  *
- * Pace requests by Settings.getInterCallPauseMs() between batches; the
- * controller's concurrent-session pool is small and rejects burst traffic
- * with HTTP 401 wrapped XML (not a real auth failure).
+ * The self-signed controller cert is trusted unconditionally — this is
+ * a LAN device behind digest auth.
  */
 public class HikvisionClient
 {
@@ -48,98 +49,72 @@ public class HikvisionClient
   private final String user;
   private final String password;
   private final int pauseMs;
+  private final HttpClient http;
 
   public HikvisionClient(String baseUrl, String user, String password, int pauseMs)
+  {
+    this(baseUrl, user, password, pauseMs, false);
+  }
+
+  public HikvisionClient(String baseUrl, String user, String password, int pauseMs, boolean verifySsl)
   {
     this.baseUrl = baseUrl.endsWith("/") ? baseUrl.substring(0, baseUrl.length() - 1) : baseUrl;
     this.user = user;
     this.password = password;
     this.pauseMs = pauseMs;
-    installTrustAll();
+    HttpClient.Builder b = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(10));
+    if (!verifySsl) b.sslContext(trustAllSslContext());
+    this.http = b.build();
   }
 
   // ---------------------------------------------------------------- HTTP
 
-  private static final SecureRandom RAND = new SecureRandom();
-
-  /**
-   * Perform an HTTP request with a fresh digest challenge-response per call.
-   * Throws if the second response is not 200/201.
-   */
+  /** One round-trip with fresh digest. Throws on non-2xx final response. */
   public String request(String method, String path, String body) throws IOException
   {
     String url = baseUrl + path;
-    // step 1: get the challenge
-    HttpURLConnection conn = open(url, method, null, body);
-    int code = conn.getResponseCode();
-    if (code != 401)
-    {
-      return readBody(conn);
-    }
-    String challenge = conn.getHeaderField("WWW-Authenticate");
-    drain(conn);
-    if (challenge == null) throw new IOException("no WWW-Authenticate header from " + url);
+    HttpResponse<String> r1 = send(method, url, body, null);
+    if (r1.statusCode() != 401) return r1.body();
 
-    // step 2: build the digest response and resend
-    String auth = buildDigestHeader(challenge, method, path, body);
-    HttpURLConnection conn2 = open(url, method, auth, body);
-    int code2 = conn2.getResponseCode();
-    String response = readBody(conn2);
-    if (code2 < 200 || code2 >= 300)
-    {
-      // Hikvision returns 200 even for failed semantic operations (with statusCode in body),
-      // so a non-2xx here is an HTTP-level failure.
-      throw new IOException("HTTP " + code2 + " on " + method + " " + path + ": " + response);
-    }
-    return response;
+    String challenge = r1.headers().firstValue("WWW-Authenticate").orElse(null);
+    if (challenge == null)
+      throw new IOException("no WWW-Authenticate header from " + url);
+
+    String auth = buildDigestHeader(challenge, method, path);
+    HttpResponse<String> r2 = send(method, url, body, auth);
+    int code = r2.statusCode();
+    if (code < 200 || code >= 300)
+      throw new IOException("HTTP " + code + " on " + method + " " + path + ": " + r2.body());
+    return r2.body();
   }
 
-  private HttpURLConnection open(String urlStr, String method, String authHeader, String body)
-      throws IOException
+  private HttpResponse<String> send(String method, String url, String body, String authHeader) throws IOException
   {
-    URL url = new URL(urlStr);
-    HttpURLConnection conn = (HttpURLConnection) url.openConnection();
-    conn.setRequestMethod(method);
-    conn.setConnectTimeout(10000);
-    conn.setReadTimeout(20000);
-    if (authHeader != null) conn.setRequestProperty("Authorization", authHeader);
-    if (body != null)
+    HttpRequest.Builder b = HttpRequest.newBuilder(URI.create(url))
+        .timeout(Duration.ofSeconds(20));
+    HttpRequest.BodyPublisher bp = body == null
+        ? HttpRequest.BodyPublishers.noBody()
+        : HttpRequest.BodyPublishers.ofString(body, StandardCharsets.UTF_8);
+    if (body != null) b.header("Content-Type", "application/json");
+    if (authHeader != null) b.header("Authorization", authHeader);
+    switch (method)
     {
-      conn.setDoOutput(true);
-      conn.setRequestProperty("Content-Type", "application/json");
-      byte[] payload = body.getBytes(StandardCharsets.UTF_8);
-      conn.setFixedLengthStreamingMode(payload.length);
-      try (OutputStream os = conn.getOutputStream()) { os.write(payload); }
+      case "GET":    b.GET();        break;
+      case "POST":   b.POST(bp);     break;
+      case "PUT":    b.PUT(bp);      break;
+      case "DELETE": b.DELETE();     break;
+      default:       b.method(method, bp);
     }
-    return conn;
-  }
-
-  private String readBody(HttpURLConnection conn) throws IOException
-  {
-    InputStream is = conn.getErrorStream();
-    if (is == null) is = conn.getInputStream();
-    if (is == null) return "";
-    ByteArrayOutputStream baos = new ByteArrayOutputStream();
-    byte[] buf = new byte[4096];
-    int n;
-    while ((n = is.read(buf)) >= 0) baos.write(buf, 0, n);
-    return baos.toString(StandardCharsets.UTF_8);
-  }
-
-  private void drain(HttpURLConnection conn)
-  {
-    try (InputStream is = conn.getErrorStream() != null ? conn.getErrorStream() : conn.getInputStream())
-    {
-      if (is != null) { byte[] buf = new byte[1024]; while (is.read(buf) >= 0) {} }
-    }
-    catch (Exception ignored) {}
+    try { return http.send(b.build(), HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8)); }
+    catch (InterruptedException e) { Thread.currentThread().interrupt(); throw new InterruptedIOException(e.getMessage()); }
   }
 
   // ---------------------------------------------------------- Digest auth
 
   private static final Pattern KV = Pattern.compile("(\\w+)\\s*=\\s*(?:\"([^\"]*)\"|([^,\\s]+))");
+  private static final SecureRandom RAND = new SecureRandom();
 
-  private String buildDigestHeader(String challenge, String method, String path, String body)
+  private String buildDigestHeader(String challenge, String method, String path)
   {
     if (!challenge.toLowerCase().startsWith("digest "))
       throw new IllegalArgumentException("not a Digest challenge: " + challenge);
@@ -157,15 +132,9 @@ public class HikvisionClient
     String nc = "00000001";
     String ha1 = md5Hex(user + ":" + realm + ":" + password);
     String ha2 = md5Hex(method + ":" + path);
-    String response;
-    if (qop != null && (qop.equals("auth") || qop.contains("auth")))
-    {
-      response = md5Hex(ha1 + ":" + nonce + ":" + nc + ":" + cnonce + ":auth:" + ha2);
-    }
-    else
-    {
-      response = md5Hex(ha1 + ":" + nonce + ":" + ha2);
-    }
+    String response = qop != null && (qop.equals("auth") || qop.contains("auth"))
+        ? md5Hex(ha1 + ":" + nonce + ":" + nc + ":" + cnonce + ":auth:" + ha2)
+        : md5Hex(ha1 + ":" + nonce + ":" + ha2);
 
     StringBuilder h = new StringBuilder("Digest ");
     h.append("username=\"").append(user).append("\", ");
@@ -208,14 +177,12 @@ public class HikvisionClient
 
   private JSONObject postJson(String path, JSONObject body) throws IOException
   {
-    String raw = request("POST", path + "?format=json", body.toString());
-    return new JSONObject(raw);
+    return new JSONObject(request("POST", path + "?format=json", body.toString()));
   }
 
   private JSONObject putJson(String path, JSONObject body) throws IOException
   {
-    String raw = request("PUT", path + "?format=json", body.toString());
-    return new JSONObject(raw);
+    return new JSONObject(request("PUT", path + "?format=json", body.toString()));
   }
 
   /** All users on the controller — paged. Optional listener gets per-batch progress. */
@@ -353,10 +320,8 @@ public class HikvisionClient
 
   // ---------------------------------------------- TLS: trust self-signed
 
-  private static boolean trustAllInstalled = false;
-  private static synchronized void installTrustAll()
+  private static SSLContext trustAllSslContext()
   {
-    if (trustAllInstalled) return;
     try
     {
       TrustManager[] tm = new TrustManager[] { new X509TrustManager() {
@@ -366,10 +331,12 @@ public class HikvisionClient
       }};
       SSLContext ctx = SSLContext.getInstance("TLS");
       ctx.init(null, tm, new SecureRandom());
-      HttpsURLConnection.setDefaultSSLSocketFactory(ctx.getSocketFactory());
-      HttpsURLConnection.setDefaultHostnameVerifier((h, s) -> true);
-      trustAllInstalled = true;
+      return ctx;
     }
-    catch (Exception e) { Logger.error("unable to install trust-all TLS", e); }
+    catch (Exception e)
+    {
+      Logger.error("unable to build trust-all SSL context", e);
+      throw new RuntimeException(e);
+    }
   }
 }

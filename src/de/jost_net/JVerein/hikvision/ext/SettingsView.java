@@ -3,11 +3,26 @@ package de.jost_net.JVerein.hikvision.ext;
 import java.util.ArrayList;
 import java.util.List;
 
+import org.eclipse.swt.SWT;
 import org.eclipse.swt.events.DisposeEvent;
 import org.eclipse.swt.events.DisposeListener;
+import org.eclipse.swt.events.SelectionAdapter;
+import org.eclipse.swt.events.SelectionEvent;
+import org.eclipse.swt.layout.GridData;
+import org.eclipse.swt.layout.GridLayout;
+import org.eclipse.swt.widgets.Button;
+import org.eclipse.swt.widgets.Composite;
+import org.eclipse.swt.widgets.Display;
+import org.eclipse.swt.widgets.MessageBox;
+import org.json.JSONArray;
+import org.json.JSONObject;
 
+import de.jost_net.JVerein.hikvision.HikvisionClient;
 import de.jost_net.JVerein.hikvision.HikvisionGroupCatalog;
 import de.jost_net.JVerein.hikvision.HikvisionSettings;
+import de.jost_net.JVerein.hikvision.PlanCache;
+import de.jost_net.JVerein.hikvision.ProgressListener;
+import de.jost_net.JVerein.hikvision.SyncEngine;
 import de.willuhn.jameica.gui.extension.Extendable;
 import de.willuhn.jameica.gui.extension.Extension;
 import de.willuhn.jameica.gui.input.CheckboxInput;
@@ -27,26 +42,20 @@ import de.willuhn.logging.Logger;
 import de.willuhn.util.ApplicationException;
 
 /**
- * "Hikvision"-Reiter in Datei → Einstellungen — nur Konfiguration.
+ * "Hikvision"-Reiter in Datei → Einstellungen. Konfiguration und
+ * Verbindungs-Helpers (Test Verbindung, Aus Hikvision laden), damit
+ * die gesamte Konfiguration in einem Settings-Aufruf abschliessbar ist.
  *
- * Mitglieder-/Sponsor-Gruppen und Region-Permission-Gruppen erscheinen
- * als Dropdowns, deren Inhalt aus dem {@link HikvisionGroupCatalog}
- * gespeist wird (= letzter Stand der Benutzer-Cache). Die UUIDs werden
- * im Hintergrund gespeichert, der Benutzer sieht nur Namen wie
- * "BSV" / "Mitglieder" / "Region 3". Wenn der Cache leer ist, fällt
- * die Anzeige auf Text-Felder zurück und ein Hinweis sagt was zu tun
- * ist.
- *
- * Daten-Views (Benutzer, Chips, Organisationsgruppen, Türrechte) leben
- * in der Navigation unter OpenJVerein > Hikvision.
+ * Die eigentliche Synchronisierung lebt in OpenJVerein > Mitglieder >
+ * Hikvision > Benutzer — Settings ist nur Setup.
  */
 public class SettingsView implements Extension
 {
   private TextInput url;
   private TextInput user;
   private PasswordInput password;
+  private CheckboxInput verifySsl;
 
-  // dropdowns when catalog has data; fallback text inputs otherwise
   private SelectInput memberGroupSelect;
   private SelectInput sponsorGroupSelect;
   private SelectInput regionPermissionSelect;
@@ -58,10 +67,13 @@ public class SettingsView implements Extension
 
   private TextInput zusatzfeldName;
   private IntegerInput interCallPauseMs;
-  private CheckboxInput dryRun;
+  private LabelInput statusLabel;
+  private Button testBtn;
+  private Button fetchBtn;
 
   private HikvisionGroupCatalog catalog;
   private MessageConsumer consumer;
+  private TabGroup tab;
 
   @Override
   public void extend(Extendable extendable)
@@ -80,82 +92,93 @@ public class SettingsView implements Extension
     };
     Application.getMessagingFactory().registerMessageConsumer(consumer);
 
-    try
-    {
-      TabGroup tab = new TabGroup(settings.getTabFolder(), "Hikvision");
-      tab.getComposite().addDisposeListener(new DisposeListener() {
-        @Override public void widgetDisposed(DisposeEvent e)
-        { Application.getMessagingFactory().unRegisterMessageConsumer(consumer); }
-      });
-
-      url = new TextInput(HikvisionSettings.getControllerUrl(), 200);
-      user = new TextInput(HikvisionSettings.getControllerUser(), 64);
-      password = new PasswordInput(HikvisionSettings.getControllerPassword());
-      zusatzfeldName = new TextInput(HikvisionSettings.getZusatzfeldName(), 64);
-      interCallPauseMs = new IntegerInput(HikvisionSettings.getInterCallPauseMs());
-      dryRun = new CheckboxInput(HikvisionSettings.getDryRun());
-
-      tab.addLabelPair("Controller-URL", url);
-      tab.addLabelPair("Benutzer", user);
-      tab.addLabelPair("Passwort", password);
-
-      // --- group / region selectors (dropdowns when catalog available) ---
-      boolean haveCatalog = catalog != null && !catalog.groups.isEmpty();
-      if (haveCatalog)
-      {
-        memberGroupSelect = makeGroupSelect(HikvisionSettings.getMemberGroupId());
-        sponsorGroupSelect = makeGroupSelect(HikvisionSettings.getSponsorGroupId());
-        tab.addLabelPair("Mitglieder-Gruppe", memberGroupSelect);
-        tab.addLabelPair("Sponsor-Gruppe", sponsorGroupSelect);
-      }
-      else
-      {
-        memberGroupIdFallback = new TextInput(HikvisionSettings.getMemberGroupId(), 64);
-        memberGroupNameFallback = new TextInput(HikvisionSettings.getMemberGroupName(), 64);
-        sponsorGroupIdFallback = new TextInput(HikvisionSettings.getSponsorGroupId(), 64);
-        sponsorGroupNameFallback = new TextInput(HikvisionSettings.getSponsorGroupName(), 64);
-        tab.addLabelPair("Mitglieder Gruppen-ID (UUID)", memberGroupIdFallback);
-        tab.addLabelPair("Mitglieder Gruppen-Name", memberGroupNameFallback);
-        tab.addLabelPair("Sponsor Gruppen-ID (UUID)", sponsorGroupIdFallback);
-        tab.addLabelPair("Sponsor Gruppen-Name", sponsorGroupNameFallback);
-      }
-
-      boolean haveRegions = catalog != null && !catalog.regions.isEmpty();
-      if (haveRegions)
-      {
-        regionPermissionSelect = makeRegionSelect(HikvisionSettings.getRegionPermissionGroup());
-        tab.addLabelPair("Region-Permission (Türrechte)", regionPermissionSelect);
-      }
-      else
-      {
-        regionPermissionFallback = new IntegerInput(HikvisionSettings.getRegionPermissionGroup());
-        tab.addLabelPair("Region-Permission-Gruppe (Türrechte)", regionPermissionFallback);
-      }
-
-      if (!haveCatalog || !haveRegions)
-      {
-        LabelInput hint = new LabelInput(
-          "Tipp: Öffne OpenJVerein > Mitglieder > Hikvision > Benutzer und klicke "
-          + "'Aktualisieren'. Danach erscheinen hier Auswahllisten statt UUID-Felder.");
-        tab.addLabelPair(" ", hint);
-      }
-      else
-      {
-        LabelInput src = new LabelInput("Aus Cache vom " + formatStamp(catalog.timestamp)
-            + "  ·  " + catalog.groups.size() + " Gruppen, " + catalog.regions.size() + " Region-Permissions");
-        tab.addLabelPair(" ", src);
-      }
-
-      tab.addLabelPair("Zusatzfeld-Name (transponder)", zusatzfeldName);
-      tab.addLabelPair("Pause zwischen Calls (ms)", interCallPauseMs);
-      tab.addCheckbox(dryRun, "Trockenlauf — nur loggen, keine Schreibvorgänge");
-    }
+    try { buildTab(settings); }
     catch (Exception e)
     {
       Logger.error("unable to extend settings", e);
       Application.getMessagingFactory().sendMessage(new StatusBarMessage(
           "Fehler beim Anzeigen der Hikvision-Einstellungen", StatusBarMessage.TYPE_ERROR));
     }
+  }
+
+  private void buildTab(Settings settings) throws Exception
+  {
+    tab = new TabGroup(settings.getTabFolder(), "Hikvision");
+    tab.getComposite().addDisposeListener(new DisposeListener() {
+      @Override public void widgetDisposed(DisposeEvent e)
+      { Application.getMessagingFactory().unRegisterMessageConsumer(consumer); }
+    });
+
+    url = new TextInput(HikvisionSettings.getControllerUrl(), 200);
+    user = new TextInput(HikvisionSettings.getControllerUser(), 64);
+    password = new PasswordInput(HikvisionSettings.getControllerPassword());
+    verifySsl = new CheckboxInput(HikvisionSettings.getVerifySsl());
+    zusatzfeldName = new TextInput(HikvisionSettings.getZusatzfeldName(), 64);
+    interCallPauseMs = new IntegerInput(HikvisionSettings.getInterCallPauseMs());
+
+    tab.addLabelPair("Controller-URL", url);
+    tab.addLabelPair("Benutzer", user);
+    tab.addLabelPair("Passwort", password);
+    tab.addCheckbox(verifySsl, "TLS-Zertifikat prüfen (deaktivieren bei selbstsignierten Controllern)");
+
+    boolean haveCatalog = catalog != null && !catalog.groups.isEmpty();
+    if (haveCatalog)
+    {
+      memberGroupSelect = makeGroupSelect(HikvisionSettings.getMemberGroupId());
+      sponsorGroupSelect = makeGroupSelect(HikvisionSettings.getSponsorGroupId());
+      tab.addLabelPair("Mitglieder-Gruppe", memberGroupSelect);
+      tab.addLabelPair("Sponsor-Gruppe", sponsorGroupSelect);
+    }
+    else
+    {
+      memberGroupIdFallback = new TextInput(HikvisionSettings.getMemberGroupId(), 64);
+      memberGroupNameFallback = new TextInput(HikvisionSettings.getMemberGroupName(), 64);
+      sponsorGroupIdFallback = new TextInput(HikvisionSettings.getSponsorGroupId(), 64);
+      sponsorGroupNameFallback = new TextInput(HikvisionSettings.getSponsorGroupName(), 64);
+      tab.addLabelPair("Mitglieder Gruppen-ID (UUID)", memberGroupIdFallback);
+      tab.addLabelPair("Mitglieder Gruppen-Name", memberGroupNameFallback);
+      tab.addLabelPair("Sponsor Gruppen-ID (UUID)", sponsorGroupIdFallback);
+      tab.addLabelPair("Sponsor Gruppen-Name", sponsorGroupNameFallback);
+    }
+
+    boolean haveRegions = catalog != null && !catalog.regions.isEmpty();
+    if (haveRegions)
+    {
+      regionPermissionSelect = makeRegionSelect(HikvisionSettings.getRegionPermissionGroup());
+      tab.addLabelPair("Region-Permission (Türrechte)", regionPermissionSelect);
+    }
+    else
+    {
+      regionPermissionFallback = new IntegerInput(HikvisionSettings.getRegionPermissionGroup());
+      tab.addLabelPair("Region-Permission-Gruppe (Türrechte)", regionPermissionFallback);
+    }
+
+    statusLabel = new LabelInput(haveCatalog || haveRegions
+        ? "Aus Cache vom " + formatStamp(catalog.timestamp) + "  ·  "
+            + catalog.groups.size() + " Gruppen, " + catalog.regions.size() + " Region-Permissions"
+        : "Noch kein Cache. Klicke 'Aus Hikvision laden' um Auswahllisten zu füllen.");
+    tab.addLabelPair("Status", statusLabel);
+
+    tab.addLabelPair("Zusatzfeld-Name (transponder)", zusatzfeldName);
+    tab.addLabelPair("Pause zwischen Calls (ms)", interCallPauseMs);
+
+    Composite btnRow = new Composite(tab.getComposite(), SWT.NONE);
+    btnRow.setLayoutData(new GridData(SWT.FILL, SWT.CENTER, true, false, 2, 1));
+    btnRow.setLayout(new GridLayout(2, true));
+
+    testBtn = new Button(btnRow, SWT.PUSH);
+    testBtn.setText("Test Verbindung");
+    testBtn.setLayoutData(new GridData(SWT.FILL, SWT.CENTER, true, false));
+    testBtn.addSelectionListener(new SelectionAdapter() {
+      @Override public void widgetSelected(SelectionEvent e) { onTest(); }
+    });
+
+    fetchBtn = new Button(btnRow, SWT.PUSH);
+    fetchBtn.setText("Gruppen + Türrechte aus Hikvision laden");
+    fetchBtn.setLayoutData(new GridData(SWT.FILL, SWT.CENTER, true, false));
+    fetchBtn.addSelectionListener(new SelectionAdapter() {
+      @Override public void widgetSelected(SelectionEvent e) { onFetch(); }
+    });
   }
 
   private SelectInput makeGroupSelect(String currentUuid)
@@ -176,13 +199,126 @@ public class SettingsView implements Extension
     return new SelectInput(items.toArray(), preselect);
   }
 
+  // ----------------------------------------------------------------- actions
+
+  private void onTest()
+  {
+    testBtn.setEnabled(false);
+    Thread t = new Thread(() -> {
+      try
+      {
+        persistConnectionFields();
+        HikvisionClient client = currentClient();
+        String xml = client.getDeviceInfoXml();
+        String model = xtract(xml, "model");
+        String fw = xtract(xml, "firmwareVersion");
+        String sn = xtract(xml, "serialNumber");
+        showInfo("Verbindung OK", "Model: " + model + "\nFirmware: " + fw + "\nSerial: " + sn);
+      }
+      catch (Exception e)
+      {
+        Logger.error("Test connection failed", e);
+        showError("Verbindung fehlgeschlagen", e.getClass().getSimpleName() + ": " + e.getMessage());
+      }
+      finally
+      {
+        Display.getDefault().asyncExec(() -> {
+          if (testBtn != null && !testBtn.isDisposed()) testBtn.setEnabled(true);
+        });
+      }
+    }, "jverein.hikvision-settings-test");
+    t.setDaemon(true); t.start();
+  }
+
+  /**
+   * Fetches UserInfo + CardInfo from Hikvision so the Settings dropdowns
+   * can be populated in-place. Writes a full PlanCache as a side effect
+   * so the other views (Benutzer / Gruppen / Türrechte) also benefit.
+   */
+  private void onFetch()
+  {
+    fetchBtn.setEnabled(false);
+    testBtn.setEnabled(false);
+    Display.getDefault().asyncExec(() -> {
+      if (statusLabel != null) statusLabel.setValue("lädt UserInfo + CardInfo …");
+    });
+    Thread t = new Thread(() -> {
+      try
+      {
+        persistConnectionFields();
+        de.jost_net.JVerein.hikvision.ChipStore chipStore =
+            de.jost_net.JVerein.hikvision.ChipStore.defaultStore();
+        SyncEngine.Plan plan = SyncEngine.computePlan(chipStore, currentClient(), new ProgressListener() {
+          @Override public void log(String msg) { Logger.info(msg); }
+          @Override public void progress(int done, int total) {}
+          @Override public void progress(int done, int total, String phase)
+          {
+            Display.getDefault().asyncExec(() -> {
+              if (statusLabel != null) statusLabel.setValue(phase + "  " + done + " / " + total + " …");
+            });
+          }
+        });
+        Display.getDefault().asyncExec(() -> {
+          showInfo("Hikvision geladen",
+              "Gruppen + Türrechte sind jetzt verfügbar. "
+              + "Bitte den Dialog schliessen und erneut öffnen, "
+              + "damit die Auswahllisten erscheinen.");
+          if (statusLabel != null)
+            statusLabel.setValue("Aktualisiert. Dialog schliessen + neu öffnen, um Dropdowns zu sehen.");
+        });
+      }
+      catch (Exception e)
+      {
+        Logger.error("Hikvision fetch failed", e);
+        showError("Laden fehlgeschlagen", e.getClass().getSimpleName() + ": " + e.getMessage());
+      }
+      finally
+      {
+        Display.getDefault().asyncExec(() -> {
+          if (fetchBtn != null && !fetchBtn.isDisposed()) fetchBtn.setEnabled(true);
+          if (testBtn != null && !testBtn.isDisposed()) testBtn.setEnabled(true);
+        });
+      }
+    }, "jverein.hikvision-settings-fetch");
+    t.setDaemon(true); t.start();
+  }
+
+  /** Save URL / user / password / verifySsl right now so test+fetch use them. */
+  private void persistConnectionFields() throws Exception
+  {
+    HikvisionSettings.setControllerUrl((String) url.getValue());
+    HikvisionSettings.setControllerUser((String) user.getValue());
+    HikvisionSettings.setControllerPassword((String) password.getValue());
+    HikvisionSettings.setVerifySsl(Boolean.TRUE.equals(verifySsl.getValue()));
+    Object pause = interCallPauseMs.getValue();
+    if (pause instanceof Integer) HikvisionSettings.setInterCallPauseMs((Integer) pause);
+  }
+
+  private HikvisionClient currentClient()
+  {
+    return new HikvisionClient(
+        HikvisionSettings.getControllerUrl(),
+        HikvisionSettings.getControllerUser(),
+        HikvisionSettings.getControllerPassword(),
+        HikvisionSettings.getInterCallPauseMs(),
+        HikvisionSettings.getVerifySsl());
+  }
+
+  private static String xtract(String xml, String tag)
+  {
+    String open = "<" + tag + ">", close = "</" + tag + ">";
+    int a = xml.indexOf(open); if (a < 0) return "(?)";
+    int b = xml.indexOf(close, a + open.length()); if (b < 0) return "(?)";
+    return xml.substring(a + open.length(), b);
+  }
+
+  // ----------------------------------------------------------------- store
+
   private void store() throws ApplicationException
   {
     try
     {
-      HikvisionSettings.setControllerUrl((String) url.getValue());
-      HikvisionSettings.setControllerUser((String) user.getValue());
-      HikvisionSettings.setControllerPassword((String) password.getValue());
+      persistConnectionFields();
 
       if (memberGroupSelect != null)
       {
@@ -229,9 +365,6 @@ public class SettingsView implements Extension
       }
 
       HikvisionSettings.setZusatzfeldName((String) zusatzfeldName.getValue());
-      Object pause = interCallPauseMs.getValue();
-      if (pause instanceof Integer) HikvisionSettings.setInterCallPauseMs((Integer) pause);
-      HikvisionSettings.setDryRun(Boolean.TRUE.equals(dryRun.getValue()));
     }
     catch (Exception e) { throw new ApplicationException(e.getMessage(), e); }
   }
@@ -241,5 +374,22 @@ public class SettingsView implements Extension
     if (ts <= 0) return "?";
     java.text.SimpleDateFormat sdf = new java.text.SimpleDateFormat("yyyy-MM-dd HH:mm");
     return sdf.format(new java.util.Date(ts));
+  }
+
+  // ----------------------------------------------------------------- dialogs
+
+  private void showError(String title, String message)
+  {
+    Display.getDefault().asyncExec(() -> {
+      MessageBox box = new MessageBox(Display.getDefault().getActiveShell(), SWT.ICON_ERROR | SWT.OK);
+      box.setText(title); box.setMessage(message); box.open();
+    });
+  }
+  private void showInfo(String title, String message)
+  {
+    Display.getDefault().asyncExec(() -> {
+      MessageBox box = new MessageBox(Display.getDefault().getActiveShell(), SWT.ICON_INFORMATION | SWT.OK);
+      box.setText(title); box.setMessage(message); box.open();
+    });
   }
 }

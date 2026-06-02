@@ -49,7 +49,8 @@ public class HikvisionBenutzerView extends AbstractView
   private Combo filterCombo;
   private ProgressBar progress;
   private Text logArea;
-  private Button refreshBtn, testBtn, syncBtn, importBtn;
+  private Button refreshBtn, syncBtn, importBtn;
+  private org.eclipse.swt.widgets.Button dryRunCheckbox;
   private java.util.List<SyncEngine.PlanRow> currentRows = java.util.Collections.emptyList();
 
   @Override
@@ -71,18 +72,12 @@ public class HikvisionBenutzerView extends AbstractView
     // --- toolbar (refresh / test / filter / count) ---
     Composite toolbar = new Composite(c, SWT.NONE);
     toolbar.setLayoutData(new GridData(SWT.FILL, SWT.CENTER, true, false, 2, 1));
-    toolbar.setLayout(new GridLayout(5, false));
+    toolbar.setLayout(new GridLayout(4, false));
 
     refreshBtn = new Button(toolbar, SWT.PUSH);
     refreshBtn.setText("Aktualisieren");
     refreshBtn.addSelectionListener(new SelectionAdapter() {
       @Override public void widgetSelected(SelectionEvent e) { onRefresh(); }
-    });
-
-    testBtn = new Button(toolbar, SWT.PUSH);
-    testBtn.setText("Test Verbindung");
-    testBtn.addSelectionListener(new SelectionAdapter() {
-      @Override public void widgetSelected(SelectionEvent e) { onTest(); }
     });
 
     new Label(toolbar, SWT.NONE).setText("Filter:");
@@ -120,10 +115,20 @@ public class HikvisionBenutzerView extends AbstractView
       tc.setText(col[0]); tc.setWidth(Integer.parseInt(col[1]));
     }
 
-    // --- action row: Sync + Import ---
+    // --- action row: dry-run + Sync + Import ---
     Composite actionRow = new Composite(c, SWT.NONE);
     actionRow.setLayoutData(new GridData(SWT.FILL, SWT.CENTER, true, false, 2, 1));
-    actionRow.setLayout(new GridLayout(2, true));
+    actionRow.setLayout(new GridLayout(3, false));
+
+    dryRunCheckbox = new org.eclipse.swt.widgets.Button(actionRow, SWT.CHECK);
+    dryRunCheckbox.setText("Trockenlauf");
+    dryRunCheckbox.setToolTipText("Wenn aktiv: nur loggen was passieren würde, keine Schreibvorgänge auf Hikvision oder jverein.");
+    dryRunCheckbox.setSelection(HikvisionSettings.getDryRun());
+    dryRunCheckbox.addSelectionListener(new SelectionAdapter() {
+      @Override public void widgetSelected(SelectionEvent e)
+      { HikvisionSettings.setDryRun(dryRunCheckbox.getSelection()); }
+    });
+    dryRunCheckbox.setLayoutData(new GridData(SWT.LEFT, SWT.CENTER, false, false));
 
     syncBtn = new Button(actionRow, SWT.PUSH);
     syncBtn.setText("Jetzt synchronisieren (jverein → Hikvision)");
@@ -228,53 +233,14 @@ public class HikvisionBenutzerView extends AbstractView
 
   // ============================================================ actions
 
-  private void onTest()
-  {
-    testBtn.setEnabled(false);
-    Thread t = new Thread(() -> {
-      try
-      {
-        HikvisionClient client = new HikvisionClient(
-            HikvisionSettings.getControllerUrl(), HikvisionSettings.getControllerUser(),
-            HikvisionSettings.getControllerPassword(), HikvisionSettings.getInterCallPauseMs());
-        String xml = client.getDeviceInfoXml();
-        String model = xtract(xml, "model");
-        String fw = xtract(xml, "firmwareVersion");
-        String sn = xtract(xml, "serialNumber");
-        Display.getDefault().asyncExec(() -> info("Verbindung OK",
-            "Model: " + model + "\nFirmware: " + fw + "\nSerial: " + sn));
-      }
-      catch (Exception e)
-      {
-        Logger.error("Test connection failed", e);
-        Display.getDefault().asyncExec(() -> error("Verbindung fehlgeschlagen",
-            e.getClass().getSimpleName() + ": " + e.getMessage()));
-      }
-      finally
-      {
-        Display.getDefault().asyncExec(() -> {
-          if (testBtn != null && !testBtn.isDisposed()) testBtn.setEnabled(true);
-        });
-      }
-    }, "jverein.hikvision-test");
-    t.setDaemon(true); t.start();
-  }
-
-  private static String xtract(String xml, String tag)
-  {
-    String open = "<" + tag + ">", close = "</" + tag + ">";
-    int a = xml.indexOf(open); if (a < 0) return "(?)";
-    int b = xml.indexOf(close, a + open.length()); if (b < 0) return "(?)";
-    return xml.substring(a + open.length(), b);
-  }
-
   private void onRefresh()
   {
     startTask("Hikvision Aktualisierung", (task, mon) -> {
       ChipStore chips = ChipStore.defaultStore();
       HikvisionClient client = new HikvisionClient(
           HikvisionSettings.getControllerUrl(), HikvisionSettings.getControllerUser(),
-          HikvisionSettings.getControllerPassword(), HikvisionSettings.getInterCallPauseMs());
+          HikvisionSettings.getControllerPassword(), HikvisionSettings.getInterCallPauseMs(),
+          HikvisionSettings.getVerifySsl());
       SyncEngine.Plan plan = SyncEngine.computePlan(chips, client, listener(task, mon));
       currentRows = plan.rows;
       Display.getDefault().asyncExec(() -> {
@@ -288,7 +254,7 @@ public class HikvisionBenutzerView extends AbstractView
   private void onSync()
   {
     startTask("Hikvision Sync", (task, mon) -> {
-      SyncEngine.Result r = SyncEngine.run(HikvisionSettings.getDryRun(), listener(task, mon));
+      SyncEngine.Result r = SyncEngine.run(dryRunCheckbox.getSelection(), listener(task, mon));
       log("\nFertig (Sync). created=" + r.created + " deleted=" + r.deleted
           + " cardsAdded=" + r.cardsAdded + " cardsRemoved=" + r.cardsRemoved
           + " errors=" + r.errors.size() + "\n");
@@ -299,12 +265,12 @@ public class HikvisionBenutzerView extends AbstractView
 
   private void onImport()
   {
-    if (!HikvisionSettings.getDryRun() && !confirm("Aus Hikvision importieren",
+    if (!dryRunCheckbox.getSelection() && !confirm("Aus Hikvision importieren",
         "Dieser Vorgang überschreibt die transponder-Zusatzfelder aller passenden jverein-Mitglieder "
         + "mit den Werten aus dem Zutrittssystem. Wirklich fortfahren?"))
       return;
     startTask("Hikvision Import", (task, mon) -> {
-      SyncEngine.ImportResult r = SyncEngine.importFromHikvision(HikvisionSettings.getDryRun(),
+      SyncEngine.ImportResult r = SyncEngine.importFromHikvision(dryRunCheckbox.getSelection(),
           listener(task, mon));
       log("\nFertig (Import). updated=" + r.membersUpdated + " unchanged=" + r.membersUnchanged
           + " hikUnmatched=" + r.hikvisionUsersUnmatched + " errors=" + r.errors.size() + "\n");
@@ -320,7 +286,7 @@ public class HikvisionBenutzerView extends AbstractView
   {
     setActionsEnabled(false);
     log("");
-    log(name + " gestartet (" + (HikvisionSettings.getDryRun() ? "Trockenlauf" : "APPLY") + ") …\n");
+    log(name + " gestartet (" + (dryRunCheckbox.getSelection() ? "Trockenlauf" : "APPLY") + ") …\n");
     if (progress != null && !progress.isDisposed()) { progress.setMaximum(100); progress.setSelection(0); }
     Application.getController().start(new HikvisionBackgroundTask() {
       @Override public void run(ProgressMonitor mon) throws ApplicationException
@@ -356,9 +322,9 @@ public class HikvisionBenutzerView extends AbstractView
     });
   }
 
-  private SyncEngine.ProgressListener listener(BackgroundTask task, ProgressMonitor mon)
+  private de.jost_net.JVerein.hikvision.ProgressListener listener(BackgroundTask task, ProgressMonitor mon)
   {
-    return new SyncEngine.ProgressListener() {
+    return new de.jost_net.JVerein.hikvision.ProgressListener() {
       @Override public void log(String msg)
       {
         if (mon != null) mon.log(msg);
@@ -390,7 +356,6 @@ public class HikvisionBenutzerView extends AbstractView
   private void setActionsEnabled(boolean en)
   {
     if (refreshBtn != null && !refreshBtn.isDisposed()) refreshBtn.setEnabled(en);
-    if (testBtn != null && !testBtn.isDisposed()) testBtn.setEnabled(en);
     if (syncBtn != null && !syncBtn.isDisposed()) syncBtn.setEnabled(en);
     if (importBtn != null && !importBtn.isDisposed()) importBtn.setEnabled(en);
   }

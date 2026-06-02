@@ -33,7 +33,7 @@ import de.willuhn.logging.Logger;
 public class SyncEngine
 {
   /** Re-exports the top-level {@link de.jost_net.JVerein.hikvision.ProgressListener}
-   *  so existing {@code SyncEngine.ProgressListener} call sites keep compiling. */
+   *  so existing {@code de.jost_net.JVerein.hikvision.ProgressListener} call sites keep compiling. */
   public interface ProgressListener extends de.jost_net.JVerein.hikvision.ProgressListener {}
 
   /** A user we want to exist on Hikvision after sync. */
@@ -113,7 +113,7 @@ public class SyncEngine
    * to-be-created jverein-side row.
    */
   public static Plan computePlan(ChipStore chips, HikvisionClient client,
-                                 ProgressListener pl) throws Exception
+                                 de.jost_net.JVerein.hikvision.ProgressListener pl) throws Exception
   {
     Plan plan = new Plan();
 
@@ -305,7 +305,7 @@ public class SyncEngine
    * Build desired state from jverein + ChipStore. Returns map: employeeNo -> Desired.
    */
   public static Map<String, Desired> buildDesired(ChipStore chips, String zusatzfeldName,
-                                                  ProgressListener pl, Result r) throws Exception
+                                                  de.jost_net.JVerein.hikvision.ProgressListener pl, Result r) throws Exception
   {
     // Pre-resolve the Felddefinition for the transponder zusatzfeld
     DBIterator<Felddefinition> defs = Einstellungen.getDBService().createList(Felddefinition.class);
@@ -372,7 +372,7 @@ public class SyncEngine
     return z.getFeld();
   }
 
-  public static Map<String, Actual> buildActual(HikvisionClient client, ProgressListener pl)
+  public static Map<String, Actual> buildActual(HikvisionClient client, de.jost_net.JVerein.hikvision.ProgressListener pl)
       throws Exception
   {
     pl.log("Hikvision UserInfo abrufen…");
@@ -400,7 +400,7 @@ public class SyncEngine
     return actual;
   }
 
-  public static Result run(boolean dryRun, ProgressListener pl) throws Exception
+  public static Result run(boolean dryRun, de.jost_net.JVerein.hikvision.ProgressListener pl) throws Exception
   {
     Result r = new Result();
     r.dryRun = dryRun;
@@ -540,7 +540,7 @@ public class SyncEngine
    * of truth and the regular {@link #run} sync (jverein → Hikvision) is
    * what you want.
    */
-  public static ImportResult importFromHikvision(boolean dryRun, ProgressListener pl) throws Exception
+  public static ImportResult importFromHikvision(boolean dryRun, de.jost_net.JVerein.hikvision.ProgressListener pl) throws Exception
   {
     ImportResult r = new ImportResult();
     r.dryRun = dryRun;
