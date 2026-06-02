@@ -27,7 +27,7 @@ import de.willuhn.jameica.system.Application;
 import de.willuhn.logging.Logger;
 
 /**
- * OpenJVerein > Hikvision > Chips
+ * OpenJVerein > Zugangssystem > Transponder
  *
  * Manage chip ↔ Kartennummer mappings persisted by {@link ChipStore}.
  * Local-only UI; never hits Hikvision.
@@ -40,7 +40,7 @@ public class HikvisionChipsView extends AbstractView
   @Override
   public void bind() throws Exception
   {
-    GUI.getView().setTitle("Zugangssystem Chips");
+    GUI.getView().setTitle("Zugangssystem Transponder");
     try { store = ChipStore.defaultStore(); }
     catch (Exception e)
     {
@@ -54,7 +54,7 @@ public class HikvisionChipsView extends AbstractView
     c.setLayout(new GridLayout(2, false));
 
     Label info = new Label(c, SWT.WRAP);
-    info.setText("Chip ↔ Kartennummer-Zuordnungen werden in Jameica gespeichert "
+    info.setText("Transponder ↔ Kartennummer-Zuordnungen werden in Jameica gespeichert "
         + "(cfg/Chips.json). Für Backup oder externe Verarbeitung können sie "
         + "als CSV exportiert / importiert werden.");
     GridData infoGd = new GridData(SWT.FILL, SWT.CENTER, true, false, 2, 1);
@@ -67,7 +67,7 @@ public class HikvisionChipsView extends AbstractView
     GridData tgd = new GridData(SWT.FILL, SWT.FILL, true, true, 2, 1);
     tgd.heightHint = 500; tgd.widthHint = 600;
     table.setLayoutData(tgd);
-    TableColumn c1 = new TableColumn(table, SWT.LEFT); c1.setText("Chip"); c1.setWidth(180);
+    TableColumn c1 = new TableColumn(table, SWT.LEFT); c1.setText("Transponder"); c1.setWidth(180);
     TableColumn c2 = new TableColumn(table, SWT.LEFT); c2.setText("Kartennummer"); c2.setWidth(240);
     TableSorter.install(table);
     refresh();
@@ -112,7 +112,7 @@ public class HikvisionChipsView extends AbstractView
 
   private void onAdd()
   {
-    String[] vals = ChipEditDialog.open(Display.getDefault().getActiveShell(), "Chip hinzufügen", "", "");
+    String[] vals = ChipEditDialog.open(Display.getDefault().getActiveShell(), "Transponder hinzufügen", "", "");
     if (vals == null) return;
     try { store.put(vals[0], vals[1]); store.save(); refresh(); }
     catch (Exception e) { err("Hinzufügen fehlgeschlagen", e.getMessage()); }
@@ -123,7 +123,7 @@ public class HikvisionChipsView extends AbstractView
     int idx = table.getSelectionIndex(); if (idx < 0) return;
     TableItem ti = table.getItem(idx);
     String oldChip = ti.getText(0), oldCard = ti.getText(1);
-    String[] vals = ChipEditDialog.open(Display.getDefault().getActiveShell(), "Chip bearbeiten", oldChip, oldCard);
+    String[] vals = ChipEditDialog.open(Display.getDefault().getActiveShell(), "Transponder bearbeiten", oldChip, oldCard);
     if (vals == null) return;
     try
     {
@@ -137,7 +137,7 @@ public class HikvisionChipsView extends AbstractView
   {
     int idx = table.getSelectionIndex(); if (idx < 0) return;
     String chip = table.getItem(idx).getText(0);
-    if (!confirm("Löschen", "Chip-Eintrag '" + chip + "' wirklich löschen?")) return;
+    if (!confirm("Löschen", "Transponder-Eintrag '" + chip + "' wirklich löschen?")) return;
     try { store.removeByChip(chip); store.save(); refresh(); }
     catch (Exception e) { err("Löschen fehlgeschlagen", e.getMessage()); }
   }
@@ -145,11 +145,11 @@ public class HikvisionChipsView extends AbstractView
   private void onImport()
   {
     FileDialog fd = new FileDialog(Display.getDefault().getActiveShell(), SWT.OPEN);
-    fd.setText("Chip-CSV importieren");
+    fd.setText("Transponder-CSV importieren");
     fd.setFilterExtensions(new String[] { "*.csv", "*.*" });
     String path = fd.open(); if (path == null) return;
     boolean overwrite = confirm("Import-Modus",
-        "Bestehende Chips überschreiben?\n\nJa = überschreiben falls Chip existiert\nNein = nur neue hinzufügen");
+        "Bestehende Transponder überschreiben?\n\nJa = überschreiben falls Transponder existiert\nNein = nur neue hinzufügen");
     try
     {
       int[] r = store.importCsv(new File(path), overwrite); refresh();
@@ -161,7 +161,7 @@ public class HikvisionChipsView extends AbstractView
   private void onExport()
   {
     FileDialog fd = new FileDialog(Display.getDefault().getActiveShell(), SWT.SAVE);
-    fd.setText("Chip-CSV exportieren"); fd.setFileName("chip_kartennummer.csv");
+    fd.setText("Transponder-CSV exportieren"); fd.setFileName("chip_kartennummer.csv");
     fd.setFilterExtensions(new String[] { "*.csv", "*.*" });
     String path = fd.open(); if (path == null) return;
     try { store.exportCsv(new File(path)); info("Export abgeschlossen", store.size() + " Einträge geschrieben"); }

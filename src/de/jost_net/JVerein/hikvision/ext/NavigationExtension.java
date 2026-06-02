@@ -46,7 +46,7 @@ public class NavigationExtension implements Extension
       NavigationItem hik = new MyItem(parent, "Zugangssystem", null);
       parent.addChild(hik);
       hik.addChild(new MyItem(hik, "Benutzer",              new HikvisionBenutzerAction()));
-      hik.addChild(new MyItem(hik, "Chips",                 new HikvisionChipsAction()));
+      hik.addChild(new MyItem(hik, "Transponder",           new HikvisionChipsAction()));
       hik.addChild(new MyItem(hik, "Organisationsgruppen",  new HikvisionGruppenAction()));
       hik.addChild(new MyItem(hik, "Türrechte",             new HikvisionRechteAction()));
     }

@@ -26,7 +26,7 @@ public final class ChipEditDialog
     sh.setText(title);
     sh.setLayout(new GridLayout(2, false));
 
-    new Label(sh, SWT.NONE).setText("Chip");
+    new Label(sh, SWT.NONE).setText("Transponder");
     Text chip = new Text(sh, SWT.BORDER);
     chip.setText(initialChip);
     chip.setLayoutData(gd(220));

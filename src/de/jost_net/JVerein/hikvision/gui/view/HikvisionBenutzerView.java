@@ -173,7 +173,7 @@ public class HikvisionBenutzerView extends AbstractView
   {
     return p.rows.size() + " Einträge — " + p.create + " neu, " + p.update
         + " geändert, " + p.delete + " löschen, " + p.hikOnly + " unverwaltet, " + p.ok + " in sync"
-        + (p.unknownCards > 0 ? "  (⚠ " + p.unknownCards + " unbekannte Chips)" : "");
+        + (p.unknownCards > 0 ? "  (⚠ " + p.unknownCards + " unbekannte Transponder)" : "");
   }
 
   private static String formatAge(long ts)
