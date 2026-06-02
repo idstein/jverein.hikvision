@@ -28,6 +28,7 @@ import de.jost_net.JVerein.hikvision.ChipStore;
 import de.jost_net.JVerein.hikvision.HikvisionClient;
 import de.jost_net.JVerein.hikvision.HikvisionSettings;
 import de.jost_net.JVerein.hikvision.Identity;
+import de.jost_net.JVerein.hikvision.PlanCache;
 import de.jost_net.JVerein.hikvision.SyncEngine;
 import de.jost_net.JVerein.rmi.Mitglied;
 import de.willuhn.datasource.rmi.DBIterator;
@@ -504,6 +505,44 @@ public class SettingsView implements Extension
       TableColumn tc = new TableColumn(usersTable, SWT.LEFT);
       tc.setText(col[0]); tc.setWidth(Integer.parseInt(col[1]));
     }
+
+    // Render from disk cache immediately so the tab isn't blank on open —
+    // no Hikvision call until the user clicks Aktualisieren.
+    loadFromCache();
+  }
+
+  private void loadFromCache()
+  {
+    PlanCache.Cached cached = PlanCache.load();
+    if (cached == null || cached.plan == null)
+    {
+      if (usersCount != null && !usersCount.isDisposed())
+        usersCount.setText("(noch nicht abgerufen — bitte 'Aktualisieren' klicken)");
+      return;
+    }
+    currentPlanRows = cached.plan.rows;
+    String age = formatAge(cached.timestamp);
+    String summary = cached.plan.rows.size() + " Einträge — "
+        + cached.plan.create + " neu, " + cached.plan.update + " geändert, "
+        + cached.plan.delete + " löschen, " + cached.plan.hikOnly + " unverwaltet, "
+        + cached.plan.ok + " in sync"
+        + (cached.plan.unknownCards > 0 ? "  (⚠ " + cached.plan.unknownCards + " unbekannte Chips)" : "")
+        + "  · letzter Abruf: " + age;
+    if (usersCount != null && !usersCount.isDisposed()) usersCount.setText(summary);
+    renderPlanRows();
+  }
+
+  private static String formatAge(long ts)
+  {
+    if (ts <= 0) return "?";
+    java.text.SimpleDateFormat sdf = new java.text.SimpleDateFormat("yyyy-MM-dd HH:mm");
+    String stamp = sdf.format(new java.util.Date(ts));
+    long mins = (System.currentTimeMillis() - ts) / 60000L;
+    if (mins < 1) return stamp + " (gerade eben)";
+    if (mins < 60) return stamp + " (vor " + mins + " Min)";
+    long hrs = mins / 60;
+    if (hrs < 48) return stamp + " (vor " + hrs + " Std)";
+    return stamp + " (vor " + (hrs / 24) + " Tagen)";
   }
 
   private void onTestConnection()
@@ -577,7 +616,8 @@ public class SettingsView implements Extension
         final String summary = plan.rows.size() + " Einträge — "
             + plan.create + " neu, " + plan.update + " geändert, " + plan.delete + " löschen, "
             + plan.hikOnly + " unverwaltet, " + plan.ok + " in sync"
-            + (plan.unknownCards > 0 ? "  (⚠ " + plan.unknownCards + " unbekannte Chips)" : "");
+            + (plan.unknownCards > 0 ? "  (⚠ " + plan.unknownCards + " unbekannte Chips)" : "")
+            + "  · letzter Abruf: gerade eben";
 
         Display.getDefault().asyncExec(() -> {
           if (usersCount != null && !usersCount.isDisposed()) usersCount.setText(summary);

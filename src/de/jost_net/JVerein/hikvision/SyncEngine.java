@@ -281,6 +281,9 @@ public class SyncEngine
     pl.log("Plan: ok=" + plan.ok + " neu=" + plan.create + " geändert=" + plan.update
         + " löschen=" + plan.delete + " hik-only=" + plan.hikOnly
         + " | übersprungen=" + plan.membersSkipped + " unbekannte Chips=" + plan.unknownCards);
+    // Persist for later UI reads — Benutzer tab loads this on open instead of
+    // hitting the controller. Only Aktualisieren/Sync re-fetches.
+    PlanCache.save(plan);
     return plan;
   }
 
@@ -488,6 +491,12 @@ public class SyncEngine
     {
       for (String e : r.errors) Logger.warn("sync error: " + e);
     }
+    // The plan cache reflects pre-apply state; if anything was applied, the
+    // cache no longer matches reality. Drop it so the Benutzer tab knows to
+    // re-fetch (better to be honest than to show stale entries as still-
+    // pending after they were just synced).
+    if (!dryRun && (r.created > 0 || r.deleted > 0 || r.cardsAdded > 0 || r.cardsRemoved > 0))
+      PlanCache.invalidate();
     return r;
   }
 
