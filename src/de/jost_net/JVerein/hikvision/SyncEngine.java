@@ -298,6 +298,10 @@ public class SyncEngine
     // Persist for later UI reads — Benutzer tab loads this on open instead of
     // hitting the controller. Only Aktualisieren/Sync re-fetches.
     PlanCache.save(plan);
+    // Also refresh the standalone catalog so the Settings dropdowns are up
+    // to date — they read from HikvisionGroups.json (the lighter file) not
+    // from PlanCache.
+    HikvisionGroupCatalog.save(HikvisionGroupCatalog.fromPlan(plan, System.currentTimeMillis()));
     return plan;
   }
 

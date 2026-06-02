@@ -259,23 +259,25 @@ public class SettingsView implements Extension
     Thread t = new Thread(() -> {
       try
       {
-        de.jost_net.JVerein.hikvision.ChipStore chipStore =
-            de.jost_net.JVerein.hikvision.ChipStore.defaultStore();
-        SyncEngine.Plan plan = SyncEngine.computePlan(chipStore, currentClient(), new ProgressListener() {
-          @Override public void log(String msg) { Logger.info(msg); }
-          @Override public void progress(int done, int total) {}
-          @Override public void progress(int done, int total, String phase)
-          {
-            Display.getDefault().asyncExec(() -> {
-              if (statusLabel != null) statusLabel.setValue(phase + "  " + done + " / " + total + " …");
+        // Lightweight path: UserInfo only — no CardInfo, no jverein DB scan,
+        // no PlanCache side effects. Settings only needs group + region data,
+        // and both live on each UserInfo record.
+        HikvisionGroupCatalog c = HikvisionGroupCatalog.refreshFromHikvision(
+            currentClient(),
+            new ProgressListener() {
+              @Override public void log(String msg) { Logger.info(msg); }
+              @Override public void progress(int done, int total) {}
+              @Override public void progress(int done, int total, String phase)
+              {
+                Display.getDefault().asyncExec(() -> {
+                  if (statusLabel != null) statusLabel.setValue(phase + "  " + done + " / " + total + " …");
+                });
+              }
             });
-          }
-        });
         Display.getDefault().asyncExec(() -> {
           showInfo("Hikvision geladen",
-              "Gruppen + Türrechte sind jetzt verfügbar. "
-              + "Bitte den Dialog schliessen und erneut öffnen, "
-              + "damit die Auswahllisten erscheinen.");
+              c.groups.size() + " Gruppen, " + c.regions.size() + " Region-Permissions geladen.\n"
+              + "Bitte den Dialog schliessen und erneut öffnen, damit die Auswahllisten erscheinen.");
           if (statusLabel != null)
             statusLabel.setValue("Aktualisiert. Dialog schliessen + neu öffnen, um Dropdowns zu sehen.");
         });

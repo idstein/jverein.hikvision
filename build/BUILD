@@ -1,3 +1,3 @@
 #Build Number for ANT. Do not edit!
-#Tue Jun 02 14:24:49 CEST 2026
-build.number=30
+#Tue Jun 02 14:32:00 CEST 2026
+build.number=31
