@@ -255,8 +255,16 @@ public class SyncEngine
         continue;
       }
 
-      // Both sides present — compare cards
+      // Both sides present — compare cards. Also overwrite the desired-side
+      // group / region fields with the Hikvision-actual values so the row
+      // reflects what's on the controller (used by HikvisionGroupCatalog for
+      // accurate member counts and by the Benutzer table for "real" state).
       d.currentCards = cur;
+      d.groupId = u.optString("userGroupNodeID", d.groupId);
+      d.groupName = u.optString("userGroupNodeName", d.groupName);
+      d.regionPermissionGroups.clear();
+      copyRegionPermissions(u, d);
+
       Set<String> add = new HashSet<>(d.desiredCards); add.removeAll(cur);
       Set<String> rem = new HashSet<>(cur); rem.removeAll(d.desiredCards);
       if (add.isEmpty() && rem.isEmpty())
@@ -412,7 +420,8 @@ public class SyncEngine
 
     HikvisionClient client = new HikvisionClient(
         HikvisionSettings.getControllerUrl(), HikvisionSettings.getControllerUser(),
-        HikvisionSettings.getControllerPassword(), HikvisionSettings.getInterCallPauseMs());
+        HikvisionSettings.getControllerPassword(), HikvisionSettings.getInterCallPauseMs(),
+        HikvisionSettings.getVerifySsl());
 
     Map<String, Desired> desired = buildDesired(chips, HikvisionSettings.getZusatzfeldName(), pl, r);
     Map<String, Actual>  actual  = buildActual(client, pl);
@@ -552,7 +561,8 @@ public class SyncEngine
 
     HikvisionClient client = new HikvisionClient(
         HikvisionSettings.getControllerUrl(), HikvisionSettings.getControllerUser(),
-        HikvisionSettings.getControllerPassword(), HikvisionSettings.getInterCallPauseMs());
+        HikvisionSettings.getControllerPassword(), HikvisionSettings.getInterCallPauseMs(),
+        HikvisionSettings.getVerifySsl());
 
     pl.log("Hikvision UserInfo abrufen…");
     JSONArray users = client.listAllUsers(pl);
