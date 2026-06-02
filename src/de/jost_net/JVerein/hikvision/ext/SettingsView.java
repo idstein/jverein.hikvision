@@ -70,6 +70,8 @@ public class SettingsView implements Extension
   private Text logArea;
   private Button syncButton;
   private Button importButton;
+  private org.eclipse.swt.widgets.ProgressBar syncProgress;
+  private Label syncProgressLabel;
 
   private Table chipTable;
   private ChipStore store;
@@ -80,6 +82,7 @@ public class SettingsView implements Extension
   private Button testButton;
   private org.eclipse.swt.widgets.Combo filterCombo;
   private java.util.List<SyncEngine.PlanRow> currentPlanRows = java.util.Collections.emptyList();
+  private org.eclipse.swt.widgets.ProgressBar usersProgress;
 
   private MessageConsumer consumer;
 
@@ -173,9 +176,18 @@ public class SettingsView implements Extension
       @Override public void widgetSelected(SelectionEvent e) { onImportClick(); }
     });
 
+    syncProgress = new org.eclipse.swt.widgets.ProgressBar(c, SWT.HORIZONTAL | SWT.SMOOTH);
+    syncProgress.setMinimum(0);
+    syncProgress.setMaximum(100);
+    syncProgress.setLayoutData(new GridData(SWT.FILL, SWT.CENTER, true, false, 2, 1));
+
+    syncProgressLabel = new Label(c, SWT.NONE);
+    syncProgressLabel.setText(" ");
+    syncProgressLabel.setLayoutData(new GridData(SWT.FILL, SWT.CENTER, true, false, 2, 1));
+
     logArea = new Text(c, SWT.MULTI | SWT.BORDER | SWT.V_SCROLL | SWT.H_SCROLL | SWT.READ_ONLY);
     GridData gd = new GridData(SWT.FILL, SWT.FILL, true, true, 2, 1);
-    gd.heightHint = 300;
+    gd.heightHint = 260;
     logArea.setLayoutData(gd);
   }
 
@@ -242,7 +254,20 @@ public class SettingsView implements Extension
     return new SyncEngine.ProgressListener()
     {
       @Override public void log(String msg) { appendLog(msg + "\n"); }
-      @Override public void progress(int done, int total) {}
+      @Override public void progress(int done, int total) { progress(done, total, ""); }
+      @Override public void progress(int done, int total, String phase)
+      {
+        Display.getDefault().asyncExec(() -> {
+          if (syncProgress != null && !syncProgress.isDisposed())
+          {
+            int safeTotal = Math.max(total, 1);
+            syncProgress.setMaximum(safeTotal);
+            syncProgress.setSelection(Math.min(done, safeTotal));
+          }
+          if (syncProgressLabel != null && !syncProgressLabel.isDisposed())
+            syncProgressLabel.setText(phase + "  " + done + " / " + total);
+        });
+      }
     };
   }
 
@@ -255,6 +280,10 @@ public class SettingsView implements Extension
     importButton.setEnabled(false);
     logArea.setText("");
     appendLog(startMsg + " (" + (isDryRun() ? "Trockenlauf" : "APPLY") + ") …\n");
+    if (syncProgress != null && !syncProgress.isDisposed())
+    { syncProgress.setMaximum(100); syncProgress.setSelection(0); }
+    if (syncProgressLabel != null && !syncProgressLabel.isDisposed())
+      syncProgressLabel.setText(" ");
     Thread t = new Thread(() -> {
       try { task.run(); }
       catch (Exception e)
@@ -488,11 +517,15 @@ public class SettingsView implements Extension
     usersCount.setText("(noch nicht abgerufen)");
     usersCount.setLayoutData(new GridData(SWT.FILL, SWT.CENTER, true, false));
 
+    usersProgress = new org.eclipse.swt.widgets.ProgressBar(c, SWT.HORIZONTAL | SWT.SMOOTH);
+    usersProgress.setMinimum(0); usersProgress.setMaximum(100);
+    usersProgress.setLayoutData(new GridData(SWT.FILL, SWT.CENTER, true, false, 2, 1));
+
     usersTable = new Table(c, SWT.BORDER | SWT.FULL_SELECTION | SWT.V_SCROLL | SWT.H_SCROLL);
     usersTable.setHeaderVisible(true);
     usersTable.setLinesVisible(true);
     GridData tgd = new GridData(SWT.FILL, SWT.FILL, true, true, 2, 1);
-    tgd.heightHint = 420; tgd.widthHint = 1000;
+    tgd.heightHint = 400; tgd.widthHint = 1000;
     usersTable.setLayoutData(tgd);
 
     String[][] cols = {
@@ -596,6 +629,8 @@ public class SettingsView implements Extension
     Display.getDefault().asyncExec(() -> {
       if (usersCount != null && !usersCount.isDisposed()) usersCount.setText("lädt …");
       if (usersTable != null && !usersTable.isDisposed()) usersTable.removeAll();
+      if (usersProgress != null && !usersProgress.isDisposed())
+      { usersProgress.setMaximum(100); usersProgress.setSelection(0); }
     });
     Thread t = new Thread(() -> {
       try
@@ -609,7 +644,20 @@ public class SettingsView implements Extension
         SyncEngine.Plan plan = SyncEngine.computePlan(chipStore, client, new SyncEngine.ProgressListener()
         {
           @Override public void log(String msg) { Logger.info(msg); }
-          @Override public void progress(int done, int total) {}
+          @Override public void progress(int done, int total) { progress(done, total, ""); }
+          @Override public void progress(int done, int total, String phase)
+          {
+            Display.getDefault().asyncExec(() -> {
+              if (usersProgress != null && !usersProgress.isDisposed())
+              {
+                int safeTotal = Math.max(total, 1);
+                usersProgress.setMaximum(safeTotal);
+                usersProgress.setSelection(Math.min(done, safeTotal));
+              }
+              if (usersCount != null && !usersCount.isDisposed())
+                usersCount.setText(phase + "  " + done + " / " + total + " …");
+            });
+          }
         });
 
         currentPlanRows = plan.rows;

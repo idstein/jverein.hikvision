@@ -32,11 +32,9 @@ import de.willuhn.logging.Logger;
  */
 public class SyncEngine
 {
-  public interface ProgressListener
-  {
-    void log(String msg);
-    void progress(int done, int total);
-  }
+  /** Re-exports the top-level {@link de.jost_net.JVerein.hikvision.ProgressListener}
+   *  so existing {@code SyncEngine.ProgressListener} call sites keep compiling. */
+  public interface ProgressListener extends de.jost_net.JVerein.hikvision.ProgressListener {}
 
   /** A user we want to exist on Hikvision after sync. */
   public static class Desired
@@ -179,9 +177,9 @@ public class SyncEngine
 
     // Pull Hikvision actual state
     pl.log("Hikvision UserInfo abrufen…");
-    JSONArray users = client.listAllUsers();
+    JSONArray users = client.listAllUsers(pl);
     pl.log("Hikvision CardInfo abrufen…");
-    JSONArray cards = client.listAllCards();
+    JSONArray cards = client.listAllCards(pl);
 
     Map<String, List<String>> cardsByEmp = new HashMap<>();
     for (int i = 0; i < cards.length(); i++)
@@ -364,9 +362,9 @@ public class SyncEngine
       throws Exception
   {
     pl.log("Hikvision UserInfo abrufen…");
-    JSONArray users = client.listAllUsers();
+    JSONArray users = client.listAllUsers(pl);
     pl.log("Hikvision CardInfo abrufen…");
-    JSONArray cards = client.listAllCards();
+    JSONArray cards = client.listAllCards(pl);
 
     Map<String, Actual> actual = new TreeMap<>();
     int unmanaged = 0;
@@ -419,6 +417,7 @@ public class SyncEngine
 
     int total = toCreate.size() + toDelete.size() + overlap.size();
     int done = 0;
+    pl.progress(done, total, "Sync läuft");
 
     // --- create ---
     for (String emp : new ArrayList<>(toCreate))
@@ -444,7 +443,7 @@ public class SyncEngine
           }
         }
       }
-      pl.progress(++done, total);
+      pl.progress(++done, total, "Sync läuft");
     }
 
     // --- delete ---
@@ -464,7 +463,7 @@ public class SyncEngine
         if (okU) r.deleted++;
         else { r.errors.add("deleteUser " + emp + " failed"); pl.log("  ! deleteUser failed"); }
       }
-      pl.progress(++done, total);
+      pl.progress(++done, total, "Sync läuft");
     }
 
     // --- card diff in overlap (note: name/type/group changes NOT handled here) ---
@@ -474,14 +473,14 @@ public class SyncEngine
       Actual a = actual.get(emp);
       Set<String> add = new HashSet<>(d.cardNos); add.removeAll(a.cardNos);
       Set<String> rem = new HashSet<>(a.cardNos); rem.removeAll(d.cardNos);
-      if (add.isEmpty() && rem.isEmpty()) { pl.progress(++done, total); continue; }
+      if (add.isEmpty() && rem.isEmpty()) { pl.progress(++done, total, "Sync läuft"); continue; }
       pl.log("UPDATE " + emp + " " + d.name + "  +" + add + "  -" + rem);
       if (!dryRun)
       {
         for (String cn : rem) { if (client.deleteCard(cn)) r.cardsRemoved++; else r.errors.add("deleteCard " + cn); }
         for (String cn : add) { if (client.createCard(emp, cn)) r.cardsAdded++; else r.errors.add("createCard " + emp + "/" + cn); }
       }
-      pl.progress(++done, total);
+      pl.progress(++done, total, "Sync läuft");
     }
 
     pl.log("=== DONE ===  created=" + r.created + " deleted=" + r.deleted
@@ -539,9 +538,9 @@ public class SyncEngine
         HikvisionSettings.getControllerPassword(), HikvisionSettings.getInterCallPauseMs());
 
     pl.log("Hikvision UserInfo abrufen…");
-    JSONArray users = client.listAllUsers();
+    JSONArray users = client.listAllUsers(pl);
     pl.log("Hikvision CardInfo abrufen…");
-    JSONArray cards = client.listAllCards();
+    JSONArray cards = client.listAllCards(pl);
 
     // group cards by employeeNo
     Map<String, List<String>> cardsByEmp = new HashMap<>();

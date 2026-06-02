@@ -217,8 +217,10 @@ public class HikvisionClient
     return new JSONObject(raw);
   }
 
-  /** All users on the controller — paged at 200 per call. */
-  public JSONArray listAllUsers() throws IOException
+  /** All users on the controller — paged. Optional listener gets per-batch progress. */
+  public JSONArray listAllUsers() throws IOException { return listAllUsers(null); }
+
+  public JSONArray listAllUsers(ProgressListener pl) throws IOException
   {
     JSONArray out = new JSONArray();
     int pos = 0;
@@ -235,6 +237,7 @@ public class HikvisionClient
       if (items != null) for (int i = 0; i < items.length(); i++) out.put(items.getJSONObject(i));
       int got = items != null ? items.length() : 0;
       Logger.info("Hikvision UserInfo/Search pos=" + pos + " got=" + got + " total=" + total);
+      if (pl != null) pl.progress(out.length(), total, "Benutzer abrufen");
       if (got == 0 || out.length() >= total) break;
       pos += got;
       pace();
@@ -242,8 +245,10 @@ public class HikvisionClient
     return out;
   }
 
-  /** All cards on the controller — paged at 200 per call. */
-  public JSONArray listAllCards() throws IOException
+  /** All cards on the controller — paged. Optional listener gets per-batch progress. */
+  public JSONArray listAllCards() throws IOException { return listAllCards(null); }
+
+  public JSONArray listAllCards(ProgressListener pl) throws IOException
   {
     JSONArray out = new JSONArray();
     int pos = 0;
@@ -260,6 +265,7 @@ public class HikvisionClient
       if (items != null) for (int i = 0; i < items.length(); i++) out.put(items.getJSONObject(i));
       int got = items != null ? items.length() : 0;
       Logger.info("Hikvision CardInfo/Search pos=" + pos + " got=" + got + " total=" + total);
+      if (pl != null) pl.progress(out.length(), total, "Karten abrufen");
       if (got == 0 || out.length() >= total) break;
       pos += got;
       pace();
