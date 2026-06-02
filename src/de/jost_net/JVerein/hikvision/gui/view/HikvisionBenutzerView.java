@@ -235,7 +235,8 @@ public class HikvisionBenutzerView extends AbstractView
 
   private void onRefresh()
   {
-    startTask("Hikvision Aktualisierung", (task, mon) -> {
+    final boolean dry = dryRunCheckbox.getSelection();
+    startTask("Hikvision Aktualisierung", dry, (task, mon) -> {
       ChipStore chips = ChipStore.defaultStore();
       HikvisionClient client = new HikvisionClient(
           HikvisionSettings.getControllerUrl(), HikvisionSettings.getControllerUser(),
@@ -253,8 +254,9 @@ public class HikvisionBenutzerView extends AbstractView
 
   private void onSync()
   {
-    startTask("Hikvision Sync", (task, mon) -> {
-      SyncEngine.Result r = SyncEngine.run(dryRunCheckbox.getSelection(), listener(task, mon));
+    final boolean dry = dryRunCheckbox.getSelection();   // UI thread — capture before submitting
+    startTask("Hikvision Sync", dry, (task, mon) -> {
+      SyncEngine.Result r = SyncEngine.run(dry, listener(task, mon));
       log("\nFertig (Sync). created=" + r.created + " deleted=" + r.deleted
           + " cardsAdded=" + r.cardsAdded + " cardsRemoved=" + r.cardsRemoved
           + " errors=" + r.errors.size() + "\n");
@@ -265,13 +267,13 @@ public class HikvisionBenutzerView extends AbstractView
 
   private void onImport()
   {
-    if (!dryRunCheckbox.getSelection() && !confirm("Aus Hikvision importieren",
+    final boolean dry = dryRunCheckbox.getSelection();   // UI thread — capture before submitting
+    if (!dry && !confirm("Aus Hikvision importieren",
         "Dieser Vorgang überschreibt die transponder-Zusatzfelder aller passenden jverein-Mitglieder "
         + "mit den Werten aus dem Zutrittssystem. Wirklich fortfahren?"))
       return;
-    startTask("Hikvision Import", (task, mon) -> {
-      SyncEngine.ImportResult r = SyncEngine.importFromHikvision(dryRunCheckbox.getSelection(),
-          listener(task, mon));
+    startTask("Hikvision Import", dry, (task, mon) -> {
+      SyncEngine.ImportResult r = SyncEngine.importFromHikvision(dry, listener(task, mon));
       log("\nFertig (Import). updated=" + r.membersUpdated + " unchanged=" + r.membersUnchanged
           + " hikUnmatched=" + r.hikvisionUsersUnmatched + " errors=" + r.errors.size() + "\n");
     });
@@ -282,11 +284,11 @@ public class HikvisionBenutzerView extends AbstractView
   @FunctionalInterface
   private interface Body { void run(BackgroundTask task, ProgressMonitor mon) throws Exception; }
 
-  private void startTask(String name, Body body)
+  private void startTask(String name, boolean dryRun, Body body)
   {
     setActionsEnabled(false);
     log("");
-    log(name + " gestartet (" + (dryRunCheckbox.getSelection() ? "Trockenlauf" : "APPLY") + ") …\n");
+    log(name + " gestartet (" + (dryRun ? "Trockenlauf" : "APPLY") + ") …\n");
     if (progress != null && !progress.isDisposed()) { progress.setMaximum(100); progress.setSelection(0); }
     Application.getController().start(new HikvisionBackgroundTask() {
       @Override public void run(ProgressMonitor mon) throws ApplicationException
