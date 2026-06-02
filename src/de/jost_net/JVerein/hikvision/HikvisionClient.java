@@ -334,6 +334,12 @@ public class HikvisionClient
     return res != null && res.optInt("statusCode", 0) == 1;
   }
 
+  /** GET /ISAPI/System/deviceInfo — returns the raw XML body for diagnostic display. */
+  public String getDeviceInfoXml() throws IOException
+  {
+    return request("GET", "/ISAPI/System/deviceInfo", null);
+  }
+
   // ---------------------------------------------- TLS: trust self-signed
 
   private static boolean trustAllInstalled = false;

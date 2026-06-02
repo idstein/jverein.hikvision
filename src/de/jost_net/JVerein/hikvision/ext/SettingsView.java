@@ -20,9 +20,17 @@ import org.eclipse.swt.widgets.TableColumn;
 import org.eclipse.swt.widgets.TableItem;
 import org.eclipse.swt.widgets.Text;
 
+import org.json.JSONArray;
+import org.json.JSONObject;
+
+import de.jost_net.JVerein.Einstellungen;
 import de.jost_net.JVerein.hikvision.ChipStore;
+import de.jost_net.JVerein.hikvision.HikvisionClient;
 import de.jost_net.JVerein.hikvision.HikvisionSettings;
+import de.jost_net.JVerein.hikvision.Identity;
 import de.jost_net.JVerein.hikvision.SyncEngine;
+import de.jost_net.JVerein.rmi.Mitglied;
+import de.willuhn.datasource.rmi.DBIterator;
 import de.willuhn.jameica.gui.extension.Extendable;
 import de.willuhn.jameica.gui.extension.Extension;
 import de.willuhn.jameica.gui.input.CheckboxInput;
@@ -65,6 +73,11 @@ public class SettingsView implements Extension
   private Table chipTable;
   private ChipStore store;
 
+  private Table usersTable;
+  private Label usersCount;
+  private Button refreshButton;
+  private Button testButton;
+
   private MessageConsumer consumer;
 
   @FunctionalInterface
@@ -98,6 +111,7 @@ public class SettingsView implements Extension
     {
       buildSyncTab(settings);
       buildChipsTab(settings);
+      buildUsersTab(settings);
     }
     catch (Exception e)
     {
@@ -420,5 +434,217 @@ public class SettingsView implements Extension
   {
     MessageBox box = new MessageBox(Display.getDefault().getActiveShell(), SWT.ICON_INFORMATION | SWT.OK);
     box.setText(title); box.setMessage(message); box.open();
+  }
+
+  // =========================================================== Users tab
+
+  private void buildUsersTab(Settings settings) throws Exception
+  {
+    TabGroup tab = new TabGroup(settings.getTabFolder(), "Hikvision Benutzer");
+    Composite c = tab.getComposite();
+
+    Label info = new Label(c, SWT.WRAP);
+    info.setText("Read-only Übersicht der auf dem Hikvision-Controller registrierten "
+        + "Benutzer. \"Aktualisieren\" lädt UserInfo + CardInfo neu und vergleicht "
+        + "mit den in jverein vorhandenen Mitgliedern.");
+    GridData infoGd = new GridData(SWT.FILL, SWT.CENTER, true, false, 2, 1);
+    infoGd.widthHint = 700;
+    info.setLayoutData(infoGd);
+
+    Composite btnRow = new Composite(c, SWT.NONE);
+    GridData brGd = new GridData(SWT.FILL, SWT.CENTER, true, false, 2, 1);
+    btnRow.setLayoutData(brGd);
+    btnRow.setLayout(new GridLayout(3, false));
+
+    refreshButton = new Button(btnRow, SWT.PUSH);
+    refreshButton.setText("Aktualisieren");
+    refreshButton.setLayoutData(new GridData(SWT.FILL, SWT.CENTER, false, false));
+    refreshButton.addSelectionListener(new SelectionAdapter() {
+      @Override public void widgetSelected(SelectionEvent e) { onRefreshUsers(); }
+    });
+
+    testButton = new Button(btnRow, SWT.PUSH);
+    testButton.setText("Test Verbindung");
+    testButton.setLayoutData(new GridData(SWT.FILL, SWT.CENTER, false, false));
+    testButton.addSelectionListener(new SelectionAdapter() {
+      @Override public void widgetSelected(SelectionEvent e) { onTestConnection(); }
+    });
+
+    usersCount = new Label(btnRow, SWT.NONE);
+    usersCount.setText("(noch nicht abgerufen)");
+    usersCount.setLayoutData(new GridData(SWT.FILL, SWT.CENTER, true, false));
+
+    usersTable = new Table(c, SWT.BORDER | SWT.FULL_SELECTION | SWT.V_SCROLL | SWT.H_SCROLL);
+    usersTable.setHeaderVisible(true);
+    usersTable.setLinesVisible(true);
+    GridData tgd = new GridData(SWT.FILL, SWT.FILL, true, true, 2, 1);
+    tgd.heightHint = 420; tgd.widthHint = 900;
+    usersTable.setLayoutData(tgd);
+
+    String[][] cols = {
+        { "employeeNo", "110" }, { "Name", "180" }, { "Typ", "70" },
+        { "Gruppe", "120" }, { "#Karten", "60" }, { "Kartennummern", "200" },
+        { "Match", "80" }, { "jverein", "160" }
+    };
+    for (String[] col : cols)
+    {
+      TableColumn tc = new TableColumn(usersTable, SWT.LEFT);
+      tc.setText(col[0]); tc.setWidth(Integer.parseInt(col[1]));
+    }
+  }
+
+  private void onTestConnection()
+  {
+    testButton.setEnabled(false);
+    Thread t = new Thread(() -> {
+      try
+      {
+        storeConfig();
+        HikvisionClient client = new HikvisionClient(
+            HikvisionSettings.getControllerUrl(), HikvisionSettings.getControllerUser(),
+            HikvisionSettings.getControllerPassword(), HikvisionSettings.getInterCallPauseMs());
+        String xml = client.getDeviceInfoXml();
+        String model = xtract(xml, "model");
+        String fw = xtract(xml, "firmwareVersion");
+        String sn = xtract(xml, "serialNumber");
+        Display.getDefault().asyncExec(() -> showInfo("Verbindung OK",
+            "Model: " + model + "\nFirmware: " + fw + "\nSerial: " + sn));
+      }
+      catch (Exception e)
+      {
+        Logger.error("Test connection failed", e);
+        Display.getDefault().asyncExec(() -> showError("Verbindung fehlgeschlagen",
+            e.getClass().getSimpleName() + ": " + e.getMessage()));
+      }
+      finally
+      {
+        Display.getDefault().asyncExec(() -> {
+          if (testButton != null && !testButton.isDisposed()) testButton.setEnabled(true);
+        });
+      }
+    }, "jverein.hikvision-test");
+    t.setDaemon(true);
+    t.start();
+  }
+
+  private static String xtract(String xml, String tag)
+  {
+    String open = "<" + tag + ">", close = "</" + tag + ">";
+    int a = xml.indexOf(open);
+    if (a < 0) return "(?)";
+    int b = xml.indexOf(close, a + open.length());
+    if (b < 0) return "(?)";
+    return xml.substring(a + open.length(), b);
+  }
+
+  private void onRefreshUsers()
+  {
+    refreshButton.setEnabled(false);
+    testButton.setEnabled(false);
+    Display.getDefault().asyncExec(() -> {
+      if (usersCount != null && !usersCount.isDisposed()) usersCount.setText("lädt …");
+      if (usersTable != null && !usersTable.isDisposed()) usersTable.removeAll();
+    });
+    Thread t = new Thread(() -> {
+      try
+      {
+        storeConfig();
+        HikvisionClient client = new HikvisionClient(
+            HikvisionSettings.getControllerUrl(), HikvisionSettings.getControllerUser(),
+            HikvisionSettings.getControllerPassword(), HikvisionSettings.getInterCallPauseMs());
+        JSONArray users = client.listAllUsers();
+        JSONArray cards = client.listAllCards();
+
+        // group cards by employeeNo
+        java.util.Map<String, java.util.List<String>> cardsByEmp = new java.util.HashMap<>();
+        for (int i = 0; i < cards.length(); i++)
+        {
+          JSONObject co = cards.getJSONObject(i);
+          cardsByEmp.computeIfAbsent(co.optString("employeeNo"), k -> new java.util.ArrayList<>())
+              .add(co.optString("cardNo"));
+        }
+
+        // index jverein members for match column
+        java.util.Map<String, Mitglied> byExterne = new java.util.HashMap<>();
+        java.util.Map<String, Mitglied> byId = new java.util.HashMap<>();
+        DBIterator<Mitglied> it = Einstellungen.getDBService().createList(Mitglied.class);
+        while (it.hasNext())
+        {
+          Mitglied m = (Mitglied) it.next();
+          byId.put(m.getID(), m);
+          String ext = m.getExterneMitgliedsnummer();
+          if (ext != null && !ext.trim().isEmpty())
+          {
+            try { byExterne.put(String.valueOf(Integer.parseInt(ext.trim())), m); }
+            catch (NumberFormatException ignored) { byExterne.put(ext.trim(), m); }
+          }
+        }
+
+        // assemble rows
+        java.util.List<String[]> rows = new java.util.ArrayList<>(users.length());
+        int matched = 0, sponsors = 0, unmanaged = 0;
+        for (int i = 0; i < users.length(); i++)
+        {
+          JSONObject u = users.getJSONObject(i);
+          String emp = u.optString("employeeNo");
+          String name = u.optString("name", "");
+          String type = u.optString("userType", "");
+          String grp = u.optString("userGroupNodeName", "");
+          java.util.List<String> uc = cardsByEmp.getOrDefault(emp, java.util.Collections.emptyList());
+
+          String match, jvName = "";
+          if (!Identity.isManaged(emp)) { match = "unverwaltet"; unmanaged++; }
+          else if (emp.startsWith("G"))
+          {
+            Mitglied m = byId.get(emp.substring(1));
+            if (m != null) { match = "Sponsor"; jvName = (m.getVorname() == null ? "" : m.getVorname()) + " " + (m.getName() == null ? "" : m.getName()); sponsors++; }
+            else { match = "Sponsor (?)"; unmanaged++; }
+          }
+          else
+          {
+            Mitglied m = null;
+            try { m = byExterne.get(String.valueOf(Integer.parseInt(emp))); }
+            catch (NumberFormatException nfe) { m = byExterne.get(emp); }
+            if (m != null) { match = "Mitglied"; jvName = (m.getVorname() == null ? "" : m.getVorname()) + " " + (m.getName() == null ? "" : m.getName()); matched++; }
+            else { match = "kein Match"; unmanaged++; }
+          }
+
+          rows.add(new String[] { emp, name, type, grp, String.valueOf(uc.size()),
+              String.join(",", uc), match, jvName.trim() });
+        }
+
+        final int fMatched = matched, fSponsors = sponsors, fUnmanaged = unmanaged;
+        final int fTotalUsers = users.length(), fTotalCards = cards.length();
+        Display.getDefault().asyncExec(() -> {
+          if (usersTable == null || usersTable.isDisposed()) return;
+          usersTable.removeAll();
+          for (String[] r : rows)
+          {
+            TableItem ti = new TableItem(usersTable, SWT.NONE);
+            for (int k = 0; k < r.length; k++) ti.setText(k, r[k]);
+          }
+          if (usersCount != null && !usersCount.isDisposed())
+            usersCount.setText(fTotalUsers + " Benutzer, " + fTotalCards + " Karten — "
+                + fMatched + " Mitglied, " + fSponsors + " Sponsor, " + fUnmanaged + " unverwaltet");
+        });
+      }
+      catch (Exception e)
+      {
+        Logger.error("user refresh failed", e);
+        Display.getDefault().asyncExec(() -> {
+          if (usersCount != null && !usersCount.isDisposed()) usersCount.setText("Fehler");
+          showError("Aktualisieren fehlgeschlagen", e.getClass().getSimpleName() + ": " + e.getMessage());
+        });
+      }
+      finally
+      {
+        Display.getDefault().asyncExec(() -> {
+          if (refreshButton != null && !refreshButton.isDisposed()) refreshButton.setEnabled(true);
+          if (testButton != null && !testButton.isDisposed()) testButton.setEnabled(true);
+        });
+      }
+    }, "jverein.hikvision-refresh");
+    t.setDaemon(true);
+    t.start();
   }
 }
