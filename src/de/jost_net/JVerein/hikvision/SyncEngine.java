@@ -302,7 +302,7 @@ public class SyncEngine
     // to date — they read from HikvisionGroups.json (the lighter file) not
     // from PlanCache.
     HikvisionGroupCatalog cat = HikvisionGroupCatalog.fromPlan(plan, System.currentTimeMillis());
-    HikvisionGroupCatalog.annotateRegionNames(cat, client, pl);
+    HikvisionGroupCatalog.annotateRegionNames(cat);
     HikvisionGroupCatalog.save(cat);
     return plan;
   }

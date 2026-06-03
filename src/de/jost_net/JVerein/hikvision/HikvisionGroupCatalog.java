@@ -72,17 +72,19 @@ public class HikvisionGroupCatalog
   }
 
   /** Loads from the dedicated catalog cache; falls back to the PlanCache if
-   *  the catalog cache isn't there yet (older versions or never-fetched). */
+   *  the catalog cache isn't there yet (older versions or never-fetched).
+   *  Always overlays user-configured region names from HikvisionSettings. */
   public static HikvisionGroupCatalog fromCache()
   {
     File f = cacheFile();
+    HikvisionGroupCatalog c = null;
     if (f.exists())
     {
       try
       {
         String raw = new String(Files.readAllBytes(f.toPath()), StandardCharsets.UTF_8);
         JSONObject root = new JSONObject(raw);
-        HikvisionGroupCatalog c = new HikvisionGroupCatalog(root.optLong("timestamp", 0));
+        c = new HikvisionGroupCatalog(root.optLong("timestamp", 0));
         JSONArray gs = root.optJSONArray("groups");
         if (gs != null) for (int i = 0; i < gs.length(); i++)
         {
@@ -100,15 +102,19 @@ public class HikvisionGroupCatalog
           rr.name = r.optString("name", "");
           c.regions.add(rr);
         }
-        return c;
       }
       catch (Exception e)
-      { Logger.error("HikvisionGroups.json kaputt — fallback auf PlanCache: " + e.getMessage(), e); }
+      { Logger.error("HikvisionGroups.json kaputt — fallback auf PlanCache: " + e.getMessage(), e); c = null; }
     }
-    // fallback to deriving from the PlanCache (legacy / no dedicated catalog yet)
-    PlanCache.Cached cached = PlanCache.load();
-    if (cached == null || cached.plan == null) return new HikvisionGroupCatalog(0);
-    return fromPlan(cached.plan, cached.timestamp);
+    if (c == null)
+    {
+      // fallback to deriving from the PlanCache (legacy / no dedicated catalog yet)
+      PlanCache.Cached cached = PlanCache.load();
+      if (cached == null || cached.plan == null) c = new HikvisionGroupCatalog(0);
+      else c = fromPlan(cached.plan, cached.timestamp);
+    }
+    annotateRegionNames(c);   // always overlay user-configured names
+    return c;
   }
 
   public static void save(HikvisionGroupCatalog c)
@@ -195,34 +201,29 @@ public class HikvisionGroupCatalog
     return c;
   }
 
-  /** Lightweight Settings-side fetch: UserInfo + UserRightPlanTemplate
-   *  names. No CardInfo, no jverein DB scan, no PlanCache write. */
+  /** Lightweight Settings-side fetch: UserInfo only. No CardInfo, no
+   *  jverein DB scan, no PlanCache write. Region-permission names are
+   *  pulled from HikvisionSettings (user-configured in Türrechte). */
   public static HikvisionGroupCatalog refreshFromHikvision(HikvisionClient client, ProgressListener pl) throws IOException
   {
     JSONArray users = client.listAllUsers(pl);
     HikvisionGroupCatalog c = fromUsers(users, System.currentTimeMillis());
-    annotateRegionNames(c, client, pl);
+    annotateRegionNames(c);
     save(c);
     return c;
   }
 
-  /** Look up UserRightPlanTemplate names and apply to the catalog's regions.
-   *  Best-effort — controller may not expose this on all firmwares. */
-  public static void annotateRegionNames(HikvisionGroupCatalog c, HikvisionClient client, ProgressListener pl)
+  /** Apply user-configured region names (from HikvisionSettings) to the
+   *  catalog's regions. Hikvision DS-K firmware doesn't expose Permission
+   *  Group display names via ISAPI — the names only live in the
+   *  controller's web UI — so the only reliable source is what the user
+   *  set locally via the Türrechte view's inline editor. */
+  public static void annotateRegionNames(HikvisionGroupCatalog c)
   {
-    try
+    for (RegionPermissionGroup r : c.regions)
     {
-      java.util.Map<Integer, String> names = client.listRightPlanTemplateNames();
-      for (RegionPermissionGroup r : c.regions)
-      {
-        String n = names.get(r.id);
-        if (n != null && !n.isEmpty()) r.name = n;
-      }
-    }
-    catch (Exception e)
-    {
-      Logger.warn("UserRightPlanTemplate lookup failed (Region-Namen bleiben numerisch): " + e.getMessage());
-      if (pl != null) pl.log("UserRightPlanTemplate-Lookup nicht verfügbar — Region-Namen bleiben numerisch.");
+      String n = HikvisionSettings.getRegionName(r.id);
+      if (n != null && !n.isEmpty()) r.name = n;
     }
   }
 
