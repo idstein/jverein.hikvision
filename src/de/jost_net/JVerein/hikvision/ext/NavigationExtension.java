@@ -45,10 +45,14 @@ public class NavigationExtension implements Extension
 
       NavigationItem hik = new MyItem(parent, "Zugangssystem", null);
       parent.addChild(hik);
-      hik.addChild(new MyItem(hik, "Benutzer",              new HikvisionBenutzerAction()));
-      hik.addChild(new MyItem(hik, "Transponder",           new HikvisionChipsAction()));
-      hik.addChild(new MyItem(hik, "Organisationsgruppen",  new HikvisionGruppenAction()));
-      hik.addChild(new MyItem(hik, "Türrechte",             new HikvisionRechteAction()));
+      // Icon reuse — jverein and jameica both ship their image resources on the
+      // shared classpath, so SWTUtil.getImage() resolves any of these names:
+      //   "user-friends.png" / "users.png"  ← jverein (same icons as Mitglieder / Familienverband)
+      //   "stock_keyring.png" / "locked.png" ← jameica (keyring + lock)
+      hik.addChild(new MyItem(hik, "Benutzer",              new HikvisionBenutzerAction(), "user-friends.png"));
+      hik.addChild(new MyItem(hik, "Transponder",           new HikvisionChipsAction(),    "stock_keyring.png"));
+      hik.addChild(new MyItem(hik, "Organisationsgruppen",  new HikvisionGruppenAction(),  "users.png"));
+      hik.addChild(new MyItem(hik, "Türrechte",             new HikvisionRechteAction(),   "locked.png"));
     }
     catch (Exception e)
     {
