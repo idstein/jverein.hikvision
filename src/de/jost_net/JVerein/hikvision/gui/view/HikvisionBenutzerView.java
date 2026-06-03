@@ -83,9 +83,14 @@ public class HikvisionBenutzerView extends AbstractView
     new Label(toolbar, SWT.NONE).setText("Filter:");
     filterCombo = new Combo(toolbar, SWT.READ_ONLY | SWT.DROP_DOWN);
     filterCombo.setItems(new String[] {
-        "Alle", "Nur neu (CREATE)", "Nur geändert (UPDATE)", "Nur löschen (DELETE)",
-        "Nur unverwaltet (HIK_ONLY)", "Nur in sync (OK)" });
-    filterCombo.select(0);
+        "Alle",
+        "Nicht OK (Aktion nötig)",
+        "Nur neu (CREATE)",
+        "Nur geändert (UPDATE)",
+        "Nur löschen (DELETE)",
+        "Nur unverwaltet (HIK_ONLY)",
+        "Nur in sync (OK)" });
+    filterCombo.select(1);   // default to "Nicht OK" — that's the actionable view
     filterCombo.addSelectionListener(new SelectionAdapter() {
       @Override public void widgetSelected(SelectionEvent e) { renderRows(); }
     });
@@ -115,6 +120,22 @@ public class HikvisionBenutzerView extends AbstractView
       tc.setText(col[0]); tc.setWidth(Integer.parseInt(col[1]));
     }
     TableSorter.install(table);
+
+    // Double-click on a row → open the corresponding jverein Mitglied
+    table.addSelectionListener(new SelectionAdapter() {
+      @Override public void widgetDefaultSelected(SelectionEvent e) { onOpenMitglied(); }
+    });
+
+    // --- mitglied bearbeiten row ---
+    Composite editRow = new Composite(c, SWT.NONE);
+    editRow.setLayoutData(new GridData(SWT.FILL, SWT.CENTER, true, false, 2, 1));
+    editRow.setLayout(new GridLayout(1, false));
+    Button editBtn = new Button(editRow, SWT.PUSH);
+    editBtn.setText("Mitglied bearbeiten (oder Zeile doppelklicken)");
+    editBtn.setLayoutData(new GridData(SWT.FILL, SWT.CENTER, true, false));
+    editBtn.addSelectionListener(new SelectionAdapter() {
+      @Override public void widgetSelected(SelectionEvent e) { onOpenMitglied(); }
+    });
 
     // --- action row: dry-run + Sync + Import ---
     Composite actionRow = new Composite(c, SWT.NONE);
@@ -193,19 +214,22 @@ public class HikvisionBenutzerView extends AbstractView
   {
     if (table == null || table.isDisposed()) return;
     table.removeAll();
-    SyncEngine.Status wanted;
+    java.util.Set<SyncEngine.Status> wanted;
     switch (filterCombo.getSelectionIndex())
     {
-      case 1: wanted = SyncEngine.Status.CREATE; break;
-      case 2: wanted = SyncEngine.Status.UPDATE; break;
-      case 3: wanted = SyncEngine.Status.DELETE; break;
-      case 4: wanted = SyncEngine.Status.HIK_ONLY; break;
-      case 5: wanted = SyncEngine.Status.OK; break;
+      case 1: // Nicht OK — anything that needs an action
+        wanted = java.util.EnumSet.of(SyncEngine.Status.CREATE, SyncEngine.Status.UPDATE, SyncEngine.Status.DELETE);
+        break;
+      case 2: wanted = java.util.EnumSet.of(SyncEngine.Status.CREATE);   break;
+      case 3: wanted = java.util.EnumSet.of(SyncEngine.Status.UPDATE);   break;
+      case 4: wanted = java.util.EnumSet.of(SyncEngine.Status.DELETE);   break;
+      case 5: wanted = java.util.EnumSet.of(SyncEngine.Status.HIK_ONLY); break;
+      case 6: wanted = java.util.EnumSet.of(SyncEngine.Status.OK);       break;
       default: wanted = null;
     }
     for (SyncEngine.PlanRow r : currentRows)
     {
-      if (wanted != null && r.status != wanted) continue;
+      if (wanted != null && !wanted.contains(r.status)) continue;
       TableItem ti = new TableItem(table, SWT.NONE);
       ti.setText(0, statusLabel(r.status));
       ti.setText(1, r.employeeNo == null ? "" : r.employeeNo);
@@ -254,6 +278,69 @@ public class HikvisionBenutzerView extends AbstractView
         renderRows();
       });
     });
+  }
+
+  /**
+   * Open the selected row's Mitglied in the JVerein detail view so the
+   * user can edit the transponder Zusatzfeld (or anything else). Looks
+   * the member up by the row's employeeNo:
+   *   "G123"  → jverein id 123  (sponsor mapping)
+   *   "456"   → jverein externemitgliedsnummer 456  (regular member)
+   * Unmanaged employeeNos (e.g. SKM*) have no jverein side and produce
+   * an error popup.
+   */
+  private void onOpenMitglied()
+  {
+    int idx = table.getSelectionIndex();
+    if (idx < 0)
+    {
+      info("Keine Zeile ausgewählt", "Bitte zuerst einen Eintrag in der Tabelle auswählen.");
+      return;
+    }
+    String emp = table.getItem(idx).getText(1);   // column 1 = employeeNo
+    try
+    {
+      de.jost_net.JVerein.rmi.Mitglied m = lookupMitglied(emp);
+      if (m == null)
+      {
+        info("Kein jverein-Mitglied",
+            "Kein zugehöriges jverein-Mitglied für employeeNo " + emp
+            + " gefunden. (Unverwaltete Hikvision-Einträge wie SKM* haben "
+            + "kein jverein-Pendant.)");
+        return;
+      }
+      new de.jost_net.JVerein.gui.action.MitgliedDetailAction().handleAction(m);
+    }
+    catch (Exception e)
+    {
+      Logger.error("open Mitglied failed", e);
+      error("Mitglied öffnen fehlgeschlagen",
+          e.getClass().getSimpleName() + ": " + e.getMessage());
+    }
+  }
+
+  private de.jost_net.JVerein.rmi.Mitglied lookupMitglied(String employeeNo) throws Exception
+  {
+    if (employeeNo == null || employeeNo.isEmpty()) return null;
+    String e = employeeNo.trim();
+    if (e.startsWith("G") && e.length() > 1)
+    {
+      String rest = e.substring(1);
+      try { Integer.parseInt(rest); }   // must be numeric for sponsor scheme
+      catch (NumberFormatException nfe) { return null; }
+      return (de.jost_net.JVerein.rmi.Mitglied) de.jost_net.JVerein.Einstellungen
+          .getDBService().createObject(de.jost_net.JVerein.rmi.Mitglied.class, rest);
+    }
+    // numeric → externemitgliedsnummer; non-numeric (SKM*) → no jverein match
+    String ext;
+    try { ext = String.valueOf(Integer.parseInt(e)); }
+    catch (NumberFormatException nfe) { return null; }
+    de.willuhn.datasource.rmi.DBIterator<de.jost_net.JVerein.rmi.Mitglied> it =
+        de.jost_net.JVerein.Einstellungen.getDBService()
+            .createList(de.jost_net.JVerein.rmi.Mitglied.class);
+    it.addFilter("externemitgliedsnummer = ?", ext);
+    if (it.hasNext()) return (de.jost_net.JVerein.rmi.Mitglied) it.next();
+    return null;
   }
 
   private void onSync()
