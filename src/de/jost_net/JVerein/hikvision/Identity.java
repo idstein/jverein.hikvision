@@ -48,6 +48,26 @@ public class Identity
     return e;
   }
 
+  /**
+   * Canonical form of a managed employeeNo so leading-zero mismatches
+   * (e.g. Hikvision "0497" vs jverein-derived "497") match as the same
+   * identity. The literal Hikvision value is preserved on {@code PlanRow}
+   * for write operations — only lookup keys get canonicalized.
+   *
+   *  - numeric (int-parseable) → strip leading zeros: "0497" → "497"
+   *  - G-prefix sponsor (e.g. "G918") → preserve as-is
+   *  - anything else (SKM*, …) → preserve as-is
+   */
+  public static String canonical(String employeeNo)
+  {
+    if (employeeNo == null) return null;
+    String e = employeeNo.trim();
+    if (e.isEmpty()) return e;
+    if (e.startsWith("G") && e.length() > 1) return e;
+    try { return String.valueOf(Integer.parseInt(e)); }
+    catch (NumberFormatException nfe) { return e; }
+  }
+
   /** Is this employeeNo one we manage (numeric or G-prefix)? SKM* etc. are not. */
   public static boolean isManaged(String employeeNo)
   {

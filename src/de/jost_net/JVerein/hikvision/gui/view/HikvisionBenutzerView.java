@@ -12,6 +12,8 @@ import org.eclipse.swt.widgets.Combo;
 import org.eclipse.swt.widgets.Composite;
 import org.eclipse.swt.widgets.Display;
 import org.eclipse.swt.widgets.Label;
+import org.eclipse.swt.widgets.Menu;
+import org.eclipse.swt.widgets.MenuItem;
 import org.eclipse.swt.widgets.MessageBox;
 import org.eclipse.swt.widgets.ProgressBar;
 import org.eclipse.swt.widgets.Table;
@@ -21,10 +23,15 @@ import org.eclipse.swt.widgets.Text;
 
 import de.jost_net.JVerein.hikvision.ChipStore;
 import de.jost_net.JVerein.hikvision.HikvisionClient;
+import de.jost_net.JVerein.hikvision.HikvisionGroupCatalog;
 import de.jost_net.JVerein.hikvision.HikvisionSettings;
+import de.jost_net.JVerein.hikvision.Identity;
+import de.jost_net.JVerein.hikvision.MitgliedAssignments;
 import de.jost_net.JVerein.hikvision.PlanCache;
 import de.jost_net.JVerein.hikvision.SyncEngine;
+import de.jost_net.JVerein.hikvision.ext.AssignmentEditDialog;
 import de.jost_net.JVerein.hikvision.ext.HikvisionBackgroundTask;
+import de.jost_net.JVerein.hikvision.ext.MitgliedPickerDialog;
 import de.willuhn.jameica.gui.AbstractView;
 import de.willuhn.jameica.gui.GUI;
 import de.willuhn.jameica.system.Application;
@@ -49,9 +56,14 @@ public class HikvisionBenutzerView extends AbstractView
   private Combo filterCombo;
   private ProgressBar progress;
   private Text logArea;
-  private Button refreshBtn, syncBtn, importBtn;
+  private Button refreshBtn, refreshVisibleBtn, refreshFullBtn, syncBtn;
   private org.eclipse.swt.widgets.Button dryRunCheckbox;
+  private Text searchField;          // live full-text search across visible columns
   private java.util.List<SyncEngine.PlanRow> currentRows = java.util.Collections.emptyList();
+  private ChipStore chipLookup;      // cached for renderRows so search/filter don't hit disk
+  private java.util.Map<Integer, String> regionNameById = java.util.Collections.emptyMap();  // Berechtigungsgruppe id → name
+  private final java.util.Set<String> unknownCardsLogged = new java.util.HashSet<>();
+  private final java.util.Map<String, java.util.List<String>> unknownCardsByEmp = new java.util.HashMap<>();
 
   @Override
   public void bind() throws Exception
@@ -63,21 +75,38 @@ public class HikvisionBenutzerView extends AbstractView
 
     Label info = new Label(c, SWT.WRAP);
     info.setText("Diff-Übersicht: was würde der nächste Sync (jverein → Hikvision) tun? "
-        + "Filter unten links wählt die Aktion. Letzter Stand wird aus dem lokalen Cache geladen — "
-        + "klicke Aktualisieren um den Hikvision-Controller neu abzufragen.");
+        + "Filter unten links wählt die Aktion. Letzter Stand wird aus lokalem Cache geladen. "
+        + "Aktualisieren (inkrementell, schnell) · Sichtbare aktualisieren (gefilterte Zeilen) · "
+        + "Vollständig (alles, ~80 s).");
     GridData infoGd = new GridData(SWT.FILL, SWT.CENTER, true, false, 2, 1);
     infoGd.widthHint = 800;
     info.setLayoutData(infoGd);
 
-    // --- toolbar (refresh / test / filter / count) ---
+    // --- toolbar (refresh modes / filter / count) ---
     Composite toolbar = new Composite(c, SWT.NONE);
     toolbar.setLayoutData(new GridData(SWT.FILL, SWT.CENTER, true, false, 2, 1));
-    toolbar.setLayout(new GridLayout(4, false));
+    toolbar.setLayout(new GridLayout(6, false));
 
     refreshBtn = new Button(toolbar, SWT.PUSH);
     refreshBtn.setText("Aktualisieren");
+    refreshBtn.setToolTipText("Inkrementell: nur Nicht-OK Zeilen und kürzlich geänderte Zuweisungen. "
+        + "Wechselt automatisch auf Vollständig wenn Cache fehlt oder die Hikvision-Gesamtzahl abweicht.");
     refreshBtn.addSelectionListener(new SelectionAdapter() {
-      @Override public void widgetSelected(SelectionEvent e) { onRefresh(); }
+      @Override public void widgetSelected(SelectionEvent e) { onRefreshIncremental(); }
+    });
+
+    refreshVisibleBtn = new Button(toolbar, SWT.PUSH);
+    refreshVisibleBtn.setText("Sichtbare aktualisieren");
+    refreshVisibleBtn.setToolTipText("Aktualisiert nur die aktuell in der Tabelle angezeigten Zeilen (Filter+Suche berücksichtigt).");
+    refreshVisibleBtn.addSelectionListener(new SelectionAdapter() {
+      @Override public void widgetSelected(SelectionEvent e) { onRefreshVisible(); }
+    });
+
+    refreshFullBtn = new Button(toolbar, SWT.PUSH);
+    refreshFullBtn.setText("Vollständig");
+    refreshFullBtn.setToolTipText("Holt alle Benutzer und Karten neu vom Controller (~80 s bei ~560 Benutzern).");
+    refreshFullBtn.addSelectionListener(new SelectionAdapter() {
+      @Override public void widgetSelected(SelectionEvent e) { onRefreshFull(); }
     });
 
     new Label(toolbar, SWT.NONE).setText("Filter:");
@@ -87,7 +116,10 @@ public class HikvisionBenutzerView extends AbstractView
         "Nicht OK (Aktion nötig)",
         "Nur neu (CREATE)",
         "Nur geändert (UPDATE)",
+        "Nur deaktivieren (DISABLE)",
+        "Nur reaktivieren (REACTIVATE)",
         "Nur löschen (DELETE)",
+        "Nur unvollständig (INCOMPLETE)",
         "Nur unverwaltet (HIK_ONLY)",
         "Nur in sync (OK)" });
     filterCombo.select(1);   // default to "Nicht OK" — that's the actionable view
@@ -98,6 +130,15 @@ public class HikvisionBenutzerView extends AbstractView
     countLabel = new Label(toolbar, SWT.NONE);
     countLabel.setText("(noch nicht abgerufen)");
     countLabel.setLayoutData(new GridData(SWT.FILL, SWT.CENTER, true, false));
+
+    Composite searchRow = new Composite(c, SWT.NONE);
+    searchRow.setLayoutData(new GridData(SWT.FILL, SWT.CENTER, true, false, 2, 1));
+    searchRow.setLayout(new GridLayout(2, false));
+    new Label(searchRow, SWT.NONE).setText("Suche:");
+    searchField = new Text(searchRow, SWT.BORDER | SWT.SEARCH | SWT.ICON_CANCEL);
+    searchField.setMessage("employeeNo, Name, Gruppe, Transponder, Hinweis …");
+    searchField.setLayoutData(new GridData(SWT.FILL, SWT.CENTER, true, false));
+    searchField.addModifyListener(e -> renderRows());
 
     progress = new ProgressBar(c, SWT.HORIZONTAL | SWT.SMOOTH);
     progress.setMinimum(0); progress.setMaximum(100);
@@ -112,8 +153,8 @@ public class HikvisionBenutzerView extends AbstractView
     table.setLayoutData(tgd);
     String[][] cols = {
         { "Status", "90" }, { "employeeNo", "100" }, { "Name", "170" },
-        { "Typ", "70" }, { "Gruppe", "100" },
-        { "Karten ist", "150" }, { "Karten soll", "150" }, { "Hinweis", "260" } };
+        { "Typ", "70" }, { "Org.-Gruppe", "100" }, { "Berechtigungsgruppen", "170" },
+        { "Transponder ist", "150" }, { "Transponder soll", "150" }, { "Hinweis", "240" } };
     for (String[] col : cols)
     {
       TableColumn tc = new TableColumn(table, SWT.LEFT);
@@ -121,30 +162,65 @@ public class HikvisionBenutzerView extends AbstractView
     }
     TableSorter.install(table);
 
-    // Double-click on a row → open the corresponding jverein Mitglied
+    // Double-click on a row → edit the assignment for that Mitglied
     table.addSelectionListener(new SelectionAdapter() {
-      @Override public void widgetDefaultSelected(SelectionEvent e) { onOpenMitglied(); }
+      @Override public void widgetDefaultSelected(SelectionEvent e) { onEditAssignment(); }
     });
 
-    // --- mitglied bearbeiten row ---
+    // Right-click context menu: edit assignment (Org-Gruppe + Berechtigungsgruppen),
+    // open the jverein Mitglied, or start a new assignment.
+    Menu ctx = new Menu(table);
+    MenuItem miEdit = new MenuItem(ctx, SWT.PUSH);
+    miEdit.setText("Zuweisung bearbeiten…");
+    miEdit.addSelectionListener(new SelectionAdapter() {
+      @Override public void widgetSelected(SelectionEvent e) { onEditAssignment(); }
+    });
+    MenuItem miOpen = new MenuItem(ctx, SWT.PUSH);
+    miOpen.setText("Mitglied öffnen");
+    miOpen.addSelectionListener(new SelectionAdapter() {
+      @Override public void widgetSelected(SelectionEvent e) { onOpenMitglied(); }
+    });
+    new MenuItem(ctx, SWT.SEPARATOR);
+    MenuItem miNew = new MenuItem(ctx, SWT.PUSH);
+    miNew.setText("Neue Zuweisung…");
+    miNew.addSelectionListener(new SelectionAdapter() {
+      @Override public void widgetSelected(SelectionEvent e) { onNewAssignment(); }
+    });
+    table.setMenu(ctx);
+
+    // --- mitglied bearbeiten / zuweisung row ---
     Composite editRow = new Composite(c, SWT.NONE);
     editRow.setLayoutData(new GridData(SWT.FILL, SWT.CENTER, true, false, 2, 1));
-    editRow.setLayout(new GridLayout(1, false));
+    editRow.setLayout(new GridLayout(3, true));
     Button editBtn = new Button(editRow, SWT.PUSH);
-    editBtn.setText("Mitglied bearbeiten (oder Zeile doppelklicken)");
+    editBtn.setText("Mitglied bearbeiten");
     editBtn.setLayoutData(new GridData(SWT.FILL, SWT.CENTER, true, false));
     editBtn.addSelectionListener(new SelectionAdapter() {
       @Override public void widgetSelected(SelectionEvent e) { onOpenMitglied(); }
+    });
+    Button editAsnBtn = new Button(editRow, SWT.PUSH);
+    editAsnBtn.setText("Zuweisung bearbeiten");
+    editAsnBtn.setToolTipText("Oder Zeile doppelklicken");
+    editAsnBtn.setLayoutData(new GridData(SWT.FILL, SWT.CENTER, true, false));
+    editAsnBtn.addSelectionListener(new SelectionAdapter() {
+      @Override public void widgetSelected(SelectionEvent e) { onEditAssignment(); }
+    });
+    Button newAsnBtn = new Button(editRow, SWT.PUSH);
+    newAsnBtn.setText("Neue Zuweisung…");
+    newAsnBtn.setToolTipText("Für ein Mitglied das noch nicht in der Liste steht");
+    newAsnBtn.setLayoutData(new GridData(SWT.FILL, SWT.CENTER, true, false));
+    newAsnBtn.addSelectionListener(new SelectionAdapter() {
+      @Override public void widgetSelected(SelectionEvent e) { onNewAssignment(); }
     });
 
     // --- action row: dry-run + Sync + Import ---
     Composite actionRow = new Composite(c, SWT.NONE);
     actionRow.setLayoutData(new GridData(SWT.FILL, SWT.CENTER, true, false, 2, 1));
-    actionRow.setLayout(new GridLayout(3, false));
+    actionRow.setLayout(new GridLayout(2, false));
 
     dryRunCheckbox = new org.eclipse.swt.widgets.Button(actionRow, SWT.CHECK);
     dryRunCheckbox.setText("Trockenlauf");
-    dryRunCheckbox.setToolTipText("Wenn aktiv: nur loggen was passieren würde, keine Schreibvorgänge auf Hikvision oder jverein.");
+    dryRunCheckbox.setToolTipText("Wenn aktiv: nur loggen was passieren würde, keine Schreibvorgänge auf Hikvision.");
     dryRunCheckbox.setSelection(HikvisionSettings.getDryRun());
     dryRunCheckbox.addSelectionListener(new SelectionAdapter() {
       @Override public void widgetSelected(SelectionEvent e)
@@ -153,17 +229,11 @@ public class HikvisionBenutzerView extends AbstractView
     dryRunCheckbox.setLayoutData(new GridData(SWT.LEFT, SWT.CENTER, false, false));
 
     syncBtn = new Button(actionRow, SWT.PUSH);
-    syncBtn.setText("Jetzt synchronisieren (jverein → Hikvision)");
+    syncBtn.setText("Jetzt synchronisieren");
+    syncBtn.setToolTipText("jverein → Hikvision");
     syncBtn.setLayoutData(new GridData(SWT.FILL, SWT.CENTER, true, false));
     syncBtn.addSelectionListener(new SelectionAdapter() {
       @Override public void widgetSelected(SelectionEvent e) { onSync(); }
-    });
-
-    importBtn = new Button(actionRow, SWT.PUSH);
-    importBtn.setText("Aus Hikvision importieren (überschreibt jverein-Transponder!)");
-    importBtn.setLayoutData(new GridData(SWT.FILL, SWT.CENTER, true, false));
-    importBtn.addSelectionListener(new SelectionAdapter() {
-      @Override public void widgetSelected(SelectionEvent e) { onImport(); }
     });
 
     // --- log area ---
@@ -186,14 +256,60 @@ public class HikvisionBenutzerView extends AbstractView
       return;
     }
     currentRows = cached.plan.rows;
+    refreshChipLookup();
     countLabel.setText(summaryFor(cached.plan) + "  · letzter Abruf: " + formatAge(cached.timestamp));
     renderRows();
   }
 
+  /** Load ChipStore from disk and emit one log line per unknown
+   *  Hikvision-side cardNo (deduped). Called once per plan load — the
+   *  cached store is reused by renderRows so search/filter don't touch
+   *  the filesystem on every keystroke. */
+  private void refreshChipLookup()
+  {
+    try { chipLookup = ChipStore.defaultStore(); }
+    catch (Exception e)
+    {
+      Logger.error("ChipStore load failed", e);
+      chipLookup = null;
+      unknownCardsByEmp.clear();
+      return;
+    }
+    // Cache Berechtigungsgruppe id→name so renderRows can show region groups
+    // without re-reading the catalog file on every keystroke.
+    try
+    {
+      java.util.Map<Integer, String> m = new java.util.HashMap<>();
+      for (HikvisionGroupCatalog.RegionPermissionGroup r : HikvisionGroupCatalog.fromCache().regions)
+        m.put(r.id, r.name == null || r.name.isEmpty() ? ("#" + r.id) : r.name);
+      regionNameById = m;
+    }
+    catch (Exception e) { regionNameById = java.util.Collections.emptyMap(); }
+    unknownCardsLogged.clear();
+    unknownCardsByEmp.clear();
+    for (SyncEngine.PlanRow r : currentRows)
+    {
+      if (r.currentCards == null) continue;
+      java.util.List<String> unknowns = null;
+      for (String card : r.currentCards)
+      {
+        if (card == null || card.isEmpty()) continue;
+        if (chipLookup.chipForCard(card) != null) continue;
+        if (unknowns == null) unknowns = new java.util.ArrayList<>();
+        unknowns.add(card);
+        if (unknownCardsLogged.add(card))
+          log("Unbekannter Transponder: " + card + " (employeeNo=" + r.employeeNo + ")\n");
+      }
+      if (unknowns != null) unknownCardsByEmp.put(r.employeeNo, unknowns);
+    }
+  }
+
   private String summaryFor(SyncEngine.Plan p)
   {
-    return p.rows.size() + " Einträge — " + p.create + " neu, " + p.update
-        + " geändert, " + p.delete + " löschen, " + p.hikOnly + " unverwaltet, " + p.ok + " in sync"
+    return p.rows.size() + " Einträge — " + p.create + " neu, " + p.update + " geändert, "
+        + p.disable + " deaktivieren, " + p.reactivate + " reaktivieren, "
+        + p.delete + " löschen, " + p.incomplete + " unvollständig, "
+        + p.hikOnly + " unverwaltet, " + p.ok + " in sync"
         + (p.unknownCards > 0 ? "  (⚠ " + p.unknownCards + " unbekannte Transponder)" : "");
   }
 
@@ -218,31 +334,118 @@ public class HikvisionBenutzerView extends AbstractView
     switch (filterCombo.getSelectionIndex())
     {
       case 1: // Nicht OK — anything that needs an action
-        wanted = java.util.EnumSet.of(SyncEngine.Status.CREATE, SyncEngine.Status.UPDATE, SyncEngine.Status.DELETE);
+        wanted = java.util.EnumSet.of(SyncEngine.Status.CREATE, SyncEngine.Status.UPDATE,
+            SyncEngine.Status.DISABLE, SyncEngine.Status.REACTIVATE,
+            SyncEngine.Status.DELETE, SyncEngine.Status.INCOMPLETE);
         break;
-      case 2: wanted = java.util.EnumSet.of(SyncEngine.Status.CREATE);   break;
-      case 3: wanted = java.util.EnumSet.of(SyncEngine.Status.UPDATE);   break;
-      case 4: wanted = java.util.EnumSet.of(SyncEngine.Status.DELETE);   break;
-      case 5: wanted = java.util.EnumSet.of(SyncEngine.Status.HIK_ONLY); break;
-      case 6: wanted = java.util.EnumSet.of(SyncEngine.Status.OK);       break;
+      case 2: wanted = java.util.EnumSet.of(SyncEngine.Status.CREATE);     break;
+      case 3: wanted = java.util.EnumSet.of(SyncEngine.Status.UPDATE);     break;
+      case 4: wanted = java.util.EnumSet.of(SyncEngine.Status.DISABLE);    break;
+      case 5: wanted = java.util.EnumSet.of(SyncEngine.Status.REACTIVATE); break;
+      case 6: wanted = java.util.EnumSet.of(SyncEngine.Status.DELETE);     break;
+      case 7: wanted = java.util.EnumSet.of(SyncEngine.Status.INCOMPLETE); break;
+      case 8: wanted = java.util.EnumSet.of(SyncEngine.Status.HIK_ONLY);   break;
+      case 9: wanted = java.util.EnumSet.of(SyncEngine.Status.OK);         break;
       default: wanted = null;
     }
+    String q = (searchField == null || searchField.isDisposed()) ? "" : searchField.getText().trim().toLowerCase();
     for (SyncEngine.PlanRow r : currentRows)
     {
       if (wanted != null && !wanted.contains(r.status)) continue;
+      String emp = r.employeeNo == null ? "" : r.employeeNo;
+      String nm  = r.name == null ? "" : r.name;
+      String ty  = r.userType == null ? "" : r.userType;
+      // Org userGroup: current controller value, or the desired/default
+      // (Mitglieder/BSV) for rows not yet on the controller (CREATE).
+      String gp  = (r.groupName != null && !r.groupName.isEmpty()) ? r.groupName
+                 : (r.desiredGroupName == null ? "" : r.desiredGroupName);
+      String ber = renderRegions(r);
+      String cur = renderTransponders(r.currentCards);
+      String des = renderTransponders(r.desiredCards);
+      String det = composeDetail(r);
+      if (!q.isEmpty())
+      {
+        String haystack = (emp + " " + nm + " " + ty + " " + gp + " " + ber + " " + cur + " " + des + " " + det).toLowerCase();
+        if (!haystack.contains(q)) continue;
+      }
       TableItem ti = new TableItem(table, SWT.NONE);
       ti.setText(0, statusLabel(r.status));
-      ti.setText(1, r.employeeNo == null ? "" : r.employeeNo);
-      ti.setText(2, r.name == null ? "" : r.name);
-      ti.setText(3, r.userType == null ? "" : r.userType);
-      ti.setText(4, r.groupName == null ? "" : r.groupName);
-      ti.setText(5, String.join(",", r.currentCards));
-      ti.setText(6, String.join(",", r.desiredCards));
-      ti.setText(7, r.detail == null ? "" : r.detail);
+      ti.setText(1, emp);
+      ti.setText(2, nm);
+      ti.setText(3, ty);
+      ti.setText(4, gp);
+      ti.setText(5, ber);
+      ti.setText(6, cur);
+      ti.setText(7, des);
+      ti.setText(8, det);
     }
     // Preserve the user's column sort across filter / refresh — without this
     // the table header keeps the ↑/↓ indicator but the rows are unsorted.
     TableSorter.reapplyIfSorted(table);
+  }
+
+  /** Compose the Hinweis column: the engine's detail plus a flag for any
+   *  unknown current cards. Phrasing depends on status — UPDATE/DISABLE/
+   *  REACTIVATE actually remove the card, DELETE removes the whole user
+   *  (warning is moot), HIK_ONLY/OK/INCOMPLETE don't touch it. */
+  private String composeDetail(SyncEngine.PlanRow r)
+  {
+    String det = r.detail == null ? "" : r.detail;
+    java.util.List<String> unk = unknownCardsByEmp.get(r.employeeNo);
+    if (unk == null || unk.isEmpty()) return det;
+    if (r.status == SyncEngine.Status.DELETE) return det;   // whole row goes away
+
+    StringBuilder cards = new StringBuilder();
+    for (String c : unk) { if (cards.length() > 0) cards.append(", "); cards.append("#").append(c); }
+
+    String warning;
+    switch (r.status)
+    {
+      case UPDATE: case DISABLE: case REACTIVATE:
+        warning = "⚠ unbekannte Karte(n) — werden bei Sync entfernt: " + cards;
+        break;
+      case HIK_ONLY:
+        warning = "⚠ unbekannte Karte(n) auf Hikvision (unverwaltet, nicht angetastet): " + cards;
+        break;
+      default:   // OK, INCOMPLETE
+        warning = "⚠ unbekannte Karte(n): " + cards;
+    }
+    return det.isEmpty() ? warning : (det + "  ·  " + warning);
+  }
+
+  /** Display cards as their Transponder ids. Cards without a ChipStore
+   *  mapping show as "Karte #<cardNo>" so the user can still see what's on
+   *  the Hikvision side, with the raw number flagged as unmapped. */
+  /** Render the row's Berechtigungsgruppen. Prefers the desired (assigned)
+   *  names; for rows with no store assignment, falls back to what's
+   *  currently on the controller (resolved via the cached id→name map),
+   *  flagged with "(ist)". */
+  private String renderRegions(SyncEngine.PlanRow r)
+  {
+    if (r.desiredRegionNames != null && !r.desiredRegionNames.isEmpty())
+      return String.join(",", r.desiredRegionNames);
+    if (r.currentRegionIds == null || r.currentRegionIds.isEmpty()) return "";
+    StringBuilder sb = new StringBuilder();
+    for (Integer id : r.currentRegionIds)
+    {
+      if (sb.length() > 0) sb.append(",");
+      String nm = regionNameById.get(id);
+      sb.append(nm != null ? nm : ("#" + id));
+    }
+    return sb.append(" (ist)").toString();
+  }
+
+  private String renderTransponders(java.util.List<String> cards)
+  {
+    if (cards == null || cards.isEmpty()) return "";
+    StringBuilder sb = new StringBuilder();
+    for (String card : cards)
+    {
+      if (sb.length() > 0) sb.append(",");
+      String chip = (chipLookup == null || card == null) ? null : chipLookup.chipForCard(card);
+      sb.append(chip != null ? chip : "Karte #" + card);
+    }
+    return sb.toString();
   }
 
   private static String statusLabel(SyncEngine.Status s)
@@ -250,34 +453,184 @@ public class HikvisionBenutzerView extends AbstractView
     if (s == null) return "?";
     switch (s)
     {
-      case OK: return "OK";
-      case CREATE: return "NEU";
-      case UPDATE: return "GEÄNDERT";
-      case DELETE: return "LÖSCHEN";
-      case HIK_ONLY: return "HIK-ONLY";
+      case OK:         return "OK";
+      case CREATE:     return "NEU";
+      case UPDATE:     return "GEÄNDERT";
+      case DISABLE:    return "DEAKTIVIEREN";
+      case REACTIVATE: return "REAKTIVIEREN";
+      case DELETE:     return "LÖSCHEN";
+      case INCOMPLETE: return "UNVOLLSTÄNDIG";
+      case HIK_ONLY:   return "HIK-ONLY";
     }
     return s.name();
   }
 
   // ============================================================ actions
 
-  private void onRefresh()
+  /** Smart "Aktualisieren": tries incremental, escalates to full on
+   *  missing cache, stale lastFullRefresh, or count-probe drift. */
+  private void onRefreshIncremental()
   {
     final boolean dry = dryRunCheckbox.getSelection();
-    startTask("Zugangssystem Aktualisierung", dry, (task, mon) -> {
+    startTask("Aktualisieren (inkrementell)", dry, (task, mon) -> {
       ChipStore chips = ChipStore.defaultStore();
-      HikvisionClient client = new HikvisionClient(
-          HikvisionSettings.getControllerUrl(), HikvisionSettings.getControllerUser(),
-          HikvisionSettings.getControllerPassword(), HikvisionSettings.getInterCallPauseMs(),
-          HikvisionSettings.getVerifySsl());
-      SyncEngine.Plan plan = SyncEngine.computePlan(chips, client, listener(task, mon));
-      currentRows = plan.rows;
+      HikvisionClient client = buildClient();
+
+      MitgliedAssignments asn = MitgliedAssignments.load();
+      PlanCache.Cached cached = PlanCache.load();
+
+      String escalate = decideEscalation(asn, cached, client);
+      if (escalate != null)
+      {
+        log("Inkrementell nicht möglich (" + escalate + ") — vollständige Aktualisierung läuft …\n");
+        runFullRefresh(asn, chips, client, task, mon);
+        return;
+      }
+
+      java.util.Set<String> scope = buildIncrementalScope(asn, cached.plan);
+      log("Inkrementeller Refresh: " + scope.size() + " employeeNo(s) im Scope "
+          + "(" + countActionableInCache(cached.plan) + " offene Aktion(en) + Zuweisungen seit letzter voller Aktualisierung)\n");
+
+      SyncEngine.Plan merged = SyncEngine.computePlanFor(scope, cached.plan, chips, client, listener(task, mon));
+      currentRows = merged.rows;
       Display.getDefault().asyncExec(() -> {
+        refreshChipLookup();
         if (countLabel != null && !countLabel.isDisposed())
-          countLabel.setText(summaryFor(plan) + "  · letzter Abruf: gerade eben");
+          countLabel.setText(summaryFor(merged) + "  · inkrementell: gerade eben");
         renderRows();
       });
     });
+  }
+
+  /** Refresh only the currently displayed (filter+search) rows. Skips
+   *  the controller round-trip entirely if nothing is visible. */
+  private void onRefreshVisible()
+  {
+    final boolean dry = dryRunCheckbox.getSelection();
+    java.util.Set<String> visible = currentlyVisibleEmployeeNos();
+    if (visible.isEmpty())
+    { info("Keine Zeilen sichtbar", "Es gibt nichts zu aktualisieren — Filter/Suche leeren oder Vollständig nutzen."); return; }
+    startTask("Aktualisieren (sichtbare: " + visible.size() + ")", dry, (task, mon) -> {
+      ChipStore chips = ChipStore.defaultStore();
+      HikvisionClient client = buildClient();
+      PlanCache.Cached cached = PlanCache.load();
+      if (cached == null || cached.plan == null)
+      { log("Kein Cache vorhanden — bitte zuerst Vollständig klicken.\n"); return; }
+      SyncEngine.Plan merged = SyncEngine.computePlanFor(visible, cached.plan, chips, client, listener(task, mon));
+      currentRows = merged.rows;
+      Display.getDefault().asyncExec(() -> {
+        refreshChipLookup();
+        if (countLabel != null && !countLabel.isDisposed())
+          countLabel.setText(summaryFor(merged) + "  · sichtbare aktualisiert: gerade eben");
+        renderRows();
+      });
+    });
+  }
+
+  /** Explicit full refresh — hits all users + cards, records totals + timestamp. */
+  private void onRefreshFull()
+  {
+    final boolean dry = dryRunCheckbox.getSelection();
+    startTask("Aktualisieren (vollständig)", dry, (task, mon) -> {
+      ChipStore chips = ChipStore.defaultStore();
+      HikvisionClient client = buildClient();
+      MitgliedAssignments asn = MitgliedAssignments.load();
+      runFullRefresh(asn, chips, client, task, mon);
+    });
+  }
+
+  private HikvisionClient buildClient()
+  {
+    return new HikvisionClient(
+        HikvisionSettings.getControllerUrl(), HikvisionSettings.getControllerUser(),
+        HikvisionSettings.getControllerPassword(), HikvisionSettings.getInterCallPauseMs(),
+        HikvisionSettings.getVerifySsl());
+  }
+
+  /** Common full-refresh body, used both by the explicit button and the
+   *  incremental flow's auto-escalation. Persists the user/card totals to
+   *  the assignment store so the next incremental can compare. */
+  private void runFullRefresh(MitgliedAssignments asn, ChipStore chips, HikvisionClient client,
+                              BackgroundTask task, ProgressMonitor mon) throws Exception
+  {
+    SyncEngine.Plan plan = SyncEngine.computePlan(chips, client, listener(task, mon));
+    currentRows = plan.rows;
+    if (plan.userTotal >= 0 && plan.cardTotal >= 0)
+      asn.recordFullRefresh(plan.userTotal, plan.cardTotal);
+    Display.getDefault().asyncExec(() -> {
+      refreshChipLookup();
+      if (countLabel != null && !countLabel.isDisposed())
+        countLabel.setText(summaryFor(plan) + "  · vollständig: gerade eben");
+      renderRows();
+    });
+  }
+
+  /** Returns a human-readable reason to escalate, or null if incremental is OK. */
+  private String decideEscalation(MitgliedAssignments asn, PlanCache.Cached cached, HikvisionClient client)
+      throws java.io.IOException
+  {
+    if (cached == null || cached.plan == null) return "kein Cache";
+    if (asn.getLastFullRefresh() <= 0)         return "noch nie vollständig aktualisiert";
+    long ageMs = System.currentTimeMillis() - asn.getLastFullRefresh();
+    if (ageMs > 7L * 24 * 3600 * 1000)         return "letzte volle Aktualisierung > 7 Tage her";
+
+    int curUsers = client.getTotalUsers();
+    int curCards = client.getTotalCards();
+    int knownUsers = asn.getLastFullUserTotal();
+    int knownCards = asn.getLastFullCardTotal();
+    if (knownUsers != curUsers || knownCards != curCards)
+      return "Hikvision Gesamtzahl abweichend (Benutzer " + knownUsers + "→" + curUsers
+          + ", Karten " + knownCards + "→" + curCards + ")";
+    return null;
+  }
+
+  /** Scope = (cached non-OK/non-HIK_ONLY rows) ∪ (assignments modified
+   *  since lastFullRefresh) ∪ (assignments whose employeeNo isn't in the
+   *  cached plan yet — could be new CREATE). */
+  private java.util.Set<String> buildIncrementalScope(MitgliedAssignments asn, SyncEngine.Plan cached)
+  {
+    java.util.Set<String> cachedEmp = new java.util.HashSet<>();
+    java.util.Set<String> scope = new java.util.HashSet<>();
+    for (SyncEngine.PlanRow r : cached.rows)
+    {
+      String canon = Identity.canonical(r.employeeNo);
+      cachedEmp.add(canon);
+      if (r.status != null && r.status != SyncEngine.Status.OK
+          && r.status != SyncEngine.Status.HIK_ONLY)
+        scope.add(canon);
+    }
+    long fullAt = asn.getLastFullRefresh();
+    for (MitgliedAssignments.Assignment a : asn.all())
+    {
+      if (a.employeeNo == null || a.employeeNo.isEmpty()) continue;
+      String canon = Identity.canonical(a.employeeNo);
+      if (a.modifiedAt > fullAt || !cachedEmp.contains(canon)) scope.add(canon);
+    }
+    return scope;
+  }
+
+  private int countActionableInCache(SyncEngine.Plan p)
+  {
+    int n = 0;
+    for (SyncEngine.PlanRow r : p.rows)
+      if (r.status != null && r.status != SyncEngine.Status.OK
+          && r.status != SyncEngine.Status.HIK_ONLY) n++;
+    return n;
+  }
+
+  /** Snapshot the employeeNos currently visible in the table (after the
+   *  user's filter+search). Reads from the live SWT widgets — must be
+   *  called on the UI thread before submitting the bg task. */
+  private java.util.Set<String> currentlyVisibleEmployeeNos()
+  {
+    java.util.Set<String> out = new java.util.LinkedHashSet<>();
+    if (table == null || table.isDisposed()) return out;
+    for (int i = 0; i < table.getItemCount(); i++)
+    {
+      String emp = table.getItem(i).getText(1);
+      if (emp != null && !emp.isEmpty()) out.add(Identity.canonical(emp));
+    }
+    return out;
   }
 
   /**
@@ -319,6 +672,78 @@ public class HikvisionBenutzerView extends AbstractView
     }
   }
 
+  /**
+   * Open the assignment editor for the selected row's Mitglied. Looks up
+   * the Mitglied by employeeNo (numeric → externe, G… → jvId) and opens
+   * {@link AssignmentEditDialog}. On save, the plan cache is invalidated
+   * and the Benutzer view re-renders from the updated store.
+   */
+  private void onEditAssignment()
+  {
+    int idx = table.getSelectionIndex();
+    if (idx < 0)
+    { info("Keine Zeile ausgewählt", "Bitte zuerst einen Eintrag in der Tabelle auswählen."); return; }
+    String emp = table.getItem(idx).getText(1);
+    try
+    {
+      de.jost_net.JVerein.rmi.Mitglied m = lookupMitglied(emp);
+      if (m == null)
+      { info("Kein jverein-Mitglied",
+          "Kein zugehöriges jverein-Mitglied für employeeNo " + emp
+          + " gefunden. (Unverwaltete Hikvision-Einträge wie SKM* haben kein jverein-Pendant.)");
+        return; }
+      openAssignmentDialogFor(m);
+    }
+    catch (Exception e)
+    {
+      Logger.error("onEditAssignment failed", e);
+      error("Zuweisung bearbeiten fehlgeschlagen", e.getClass().getSimpleName() + ": " + e.getMessage());
+    }
+  }
+
+  /** Show the Mitglieder picker, then open the assignment editor for the
+   *  chosen Mitglied. Used to assign chips to people who aren't yet on
+   *  Hikvision (= not in the current Plan view at all). */
+  private void onNewAssignment()
+  {
+    try
+    {
+      MitgliedPickerDialog.Picked p = MitgliedPickerDialog.open(GUI.getShell());
+      if (p == null) return;
+      de.jost_net.JVerein.rmi.Mitglied m =
+          (de.jost_net.JVerein.rmi.Mitglied) de.jost_net.JVerein.Einstellungen.getDBService()
+              .createObject(de.jost_net.JVerein.rmi.Mitglied.class, p.jvId);
+      openAssignmentDialogFor(m);
+    }
+    catch (Exception e)
+    {
+      Logger.error("onNewAssignment failed", e);
+      error("Neue Zuweisung fehlgeschlagen", e.getClass().getSimpleName() + ": " + e.getMessage());
+    }
+  }
+
+  /** Shared opener: load store + chip store, open the dialog, on save
+   *  invalidate the plan cache so the next Aktualisieren shows the new state. */
+  private void openAssignmentDialogFor(de.jost_net.JVerein.rmi.Mitglied m) throws Exception
+  {
+    String vn = m.getVorname() == null ? "" : m.getVorname().trim();
+    String nn = m.getName() == null ? "" : m.getName().trim();
+    String displayName = (vn + " " + nn).trim();
+    String externe = m.getExterneMitgliedsnummer() == null ? "" : m.getExterneMitgliedsnummer().trim();
+    String employeeNo = Identity.of(m).employeeNo;
+
+    MitgliedAssignments store = MitgliedAssignments.load();
+    ChipStore chips = ChipStore.defaultStore();
+
+    boolean saved = AssignmentEditDialog.open(GUI.getShell(), store, chips,
+        m.getID(), displayName, employeeNo, externe);
+    if (saved)
+    {
+      log("Zuweisung für " + displayName + " gespeichert. PlanCache invalidiert — bitte 'Aktualisieren' klicken.\n");
+      PlanCache.invalidate();
+    }
+  }
+
   private de.jost_net.JVerein.rmi.Mitglied lookupMitglied(String employeeNo) throws Exception
   {
     if (employeeNo == null || employeeNo.isEmpty()) return null;
@@ -353,20 +778,6 @@ public class HikvisionBenutzerView extends AbstractView
           + " errors=" + r.errors.size() + "\n");
       // refresh cache view post-sync
       Display.getDefault().asyncExec(this::loadCachedPlan);
-    });
-  }
-
-  private void onImport()
-  {
-    final boolean dry = dryRunCheckbox.getSelection();   // UI thread — capture before submitting
-    if (!dry && !confirm("Aus Hikvision importieren",
-        "Dieser Vorgang überschreibt die transponder-Zusatzfelder aller passenden jverein-Mitglieder "
-        + "mit den Werten aus dem Zutrittssystem. Wirklich fortfahren?"))
-      return;
-    startTask("Zugangssystem Import", dry, (task, mon) -> {
-      SyncEngine.ImportResult r = SyncEngine.importFromHikvision(dry, listener(task, mon));
-      log("\nFertig (Import). updated=" + r.membersUpdated + " unchanged=" + r.membersUnchanged
-          + " hikUnmatched=" + r.hikvisionUsersUnmatched + " errors=" + r.errors.size() + "\n");
     });
   }
 
@@ -449,8 +860,9 @@ public class HikvisionBenutzerView extends AbstractView
   private void setActionsEnabled(boolean en)
   {
     if (refreshBtn != null && !refreshBtn.isDisposed()) refreshBtn.setEnabled(en);
+    if (refreshVisibleBtn != null && !refreshVisibleBtn.isDisposed()) refreshVisibleBtn.setEnabled(en);
+    if (refreshFullBtn != null && !refreshFullBtn.isDisposed()) refreshFullBtn.setEnabled(en);
     if (syncBtn != null && !syncBtn.isDisposed()) syncBtn.setEnabled(en);
-    if (importBtn != null && !importBtn.isDisposed()) importBtn.setEnabled(en);
   }
 
   private void log(String s)
@@ -464,11 +876,6 @@ public class HikvisionBenutzerView extends AbstractView
     });
   }
 
-  private boolean confirm(String title, String msg)
-  {
-    MessageBox b = new MessageBox(GUI.getShell(), SWT.ICON_WARNING | SWT.YES | SWT.NO);
-    b.setText(title); b.setMessage(msg); return b.open() == SWT.YES;
-  }
   private void error(String title, String msg)
   { MessageBox b = new MessageBox(GUI.getShell(), SWT.ICON_ERROR | SWT.OK);
     b.setText(title); b.setMessage(msg); b.open(); }

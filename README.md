@@ -52,11 +52,14 @@ left strictly alone — never touched, never deleted.
    - Controller user / password (digest auth — password lives in Jameica's
      encrypted Wallet, not the plain properties file)
    - Path to `chip_kartennummer.csv` (the chip ↔ Kartennummer lookup)
-   - Mitglieder group UUID + name
-   - Sponsor (guest) group UUID + name
-   - Region permission group id (door access — typically `3` to match
-     existing Mitglieder)
+   - Mitglieder org-group UUID + name (default userGroup for members)
+   - Sponsor (guest) org-group UUID + name (default userGroup for sponsors)
    - Zusatzfeld name (default `transponder`)
+
+   Door-access **Berechtigungsgruppen** are no longer a single global
+   setting — they are assigned per member (0..n) via *Zugangssystem →
+   Benutzer → Zuweisung bearbeiten* and synced to each user's
+   `regionPermissionGroupIDList`.
    - Pause between calls (ms — the DS-K controller has a small concurrent-
      session pool; `2000` is the safe default)
 4. Click **Speichern** to persist settings, then **Jetzt synchronisieren**.
@@ -104,8 +107,17 @@ each upstream — no transitive source build needed.
   place. Renames are done create-first / move card / delete-old.
 - Create endpoints want **a single object**, not an array:
   `{"UserInfo": {…}}`, not `{"UserInfo": [{…}]}`.
-- Group create/list endpoints return `notSupport` on this firmware —
-  manage groups via the web UI.
+- Groups **can** be listed via ISAPI (despite older notes to the contrary):
+  - org user groups: `POST /ISAPI/AccessControl/UserGroupMgr/SearchUserGroup`
+    → `matchResults[].nodeID/nodeName/userNum`
+  - door permission groups (Berechtigungsgruppen):
+    `POST /ISAPI/AccessControl/DoorRegionMgr/SearchRegionPermissionGroup`
+    → `matchResults[].regionPermissionGroupID/regionPermissionGroupName/doorIDList`
+  Both search bodies are **1-based** (`searchResultPosition` ≥ 1) and cap
+  `maxResults` at 33.
+- Door access is granted by the user's `regionPermissionGroupIDList`
+  (a list — a member may hold several), **not** by the org `userGroupNode`.
+  The org userGroup is just where the user lives in the tree.
 
 ## Status
 

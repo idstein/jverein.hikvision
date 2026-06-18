@@ -1,6 +1,8 @@
 package de.jost_net.JVerein.hikvision;
 
+import java.text.SimpleDateFormat;
 import java.util.ArrayList;
+import java.util.Calendar;
 import java.util.Date;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -13,58 +15,61 @@ import org.json.JSONArray;
 import org.json.JSONObject;
 
 import de.jost_net.JVerein.Einstellungen;
-import de.jost_net.JVerein.rmi.Felddefinition;
 import de.jost_net.JVerein.rmi.Mitglied;
-import de.jost_net.JVerein.rmi.Zusatzfelder;
 import de.willuhn.datasource.rmi.DBIterator;
 import de.willuhn.logging.Logger;
 
 /**
- * Computes the diff between jverein (source of truth) and the Hikvision
- * controller, and applies the diff. Manual one-shot run — triggered from
- * the Hikvision settings tab button.
+ * Computes the diff between jverein + {@link MitgliedAssignments} (source
+ * of truth) and the Hikvision controller, and applies the diff.
  *
- * Only employeeNos this plugin "manages" are touched on the controller —
- * a managed employeeNo is either int-parseable (matched to a jverein
- * externemitgliedsnummer) or starts with 'G' followed by digits (sponsor
- * mapped to jverein id). Everything else (SKM00000NNN admin/loaner
- * entries, etc.) is ignored.
+ * <p>v0.15 rewire: transponder + group assignments now live in the
+ * plugin-owned {@link MitgliedAssignments} store instead of the jverein
+ * transponder Zusatzfeld. Per-user Türrechte (regionPermissionGroupIDList)
+ * are NO LONGER synced — Hikvision derives access permissions from the
+ * user's group membership automatically.
+ *
+ * <h2>Status semantics</h2>
+ * <ul>
+ *   <li>{@link Status#OK} — nothing to do</li>
+ *   <li>{@link Status#CREATE} — managed jverein member has assignment with
+ *       at least one transponder, but no Hikvision record yet</li>
+ *   <li>{@link Status#UPDATE} — card list / group / endTime differs; no
+ *       enable-state flip</li>
+ *   <li>{@link Status#DISABLE} — jverein austritt is set (today or past),
+ *       Hikvision record is still enabled → flip {@code Valid.enable=false}
+ *       and set {@code Valid.endTime=austritt}. Cards stay attached (history
+ *       preservation). Applies to blackList users too — both flags coexist.</li>
+ *   <li>{@link Status#REACTIVATE} — austritt cleared, Hikvision record is
+ *       disabled → flip {@code Valid.enable=true}</li>
+ *   <li>{@link Status#DELETE} — Hikvision record has a managed employeeNo
+ *       but the corresponding jverein Mitglied has been deleted entirely
+ *       (truly orphaned). Sets are uncommon — the user wanted this kept
+ *       narrow so accidental austritt doesn't purge history.</li>
+ *   <li>{@link Status#INCOMPLETE} — Hikvision record exists for a known
+ *       jverein Mitglied, but {@link MitgliedAssignments} doesn't have an
+ *       entry yet. Surfaced so the user can run migrate or assign in UI.</li>
+ *   <li>{@link Status#HIK_ONLY} — non-managed employeeNo (SKM* etc.) —
+ *       never touched by sync.</li>
+ * </ul>
  */
 public class SyncEngine
 {
-  /** Re-exports the top-level {@link de.jost_net.JVerein.hikvision.ProgressListener}
-   *  so existing {@code de.jost_net.JVerein.hikvision.ProgressListener} call sites keep compiling. */
+  /** Re-exports the top-level {@link de.jost_net.JVerein.hikvision.ProgressListener} */
   public interface ProgressListener extends de.jost_net.JVerein.hikvision.ProgressListener {}
-
-  /** A user we want to exist on Hikvision after sync. */
-  public static class Desired
-  {
-    public final String employeeNo;
-    public final String name;
-    public final boolean isSponsor;
-    public final Set<String> cardNos = new HashSet<>();
-    public final String jvName;
-    public final String jvId;
-    Desired(String emp, String name, boolean sponsor, String jvId)
-    { this.employeeNo = emp; this.name = name; this.isSponsor = sponsor;
-      this.jvId = jvId; this.jvName = name; }
-  }
-
-  /** A user currently on Hikvision (only managed ones). */
-  public static class Actual
-  {
-    public final String employeeNo;
-    public final String name;
-    public final Set<String> cardNos = new HashSet<>();
-    Actual(String emp, String name) { this.employeeNo = emp; this.name = name; }
-  }
 
   public static class Result
   {
     public int created;
+    public int disabled;
+    public int reactivated;
+    public int updated;
     public int deleted;
     public int cardsAdded;
     public int cardsRemoved;
+    public int groupsChanged;      // org userGroup (userGroupNodeID) moves
+    public int regionsChanged;     // Berechtigungsgruppen (regionPermissionGroupIDList) changes
+    public int validChanged;
     public int skippedMembers;
     public int unknownCards;
     public final List<String> errors = new ArrayList<>();
@@ -77,56 +82,189 @@ public class SyncEngine
   {
     OK,         // in sync — no action
     CREATE,     // new in jverein, would be created on Hikvision
-    UPDATE,     // cards differ — would be added/removed on Hikvision
-    DELETE,     // on Hikvision, jverein says it shouldn't be (austritt or removed)
-    HIK_ONLY    // on Hikvision with an unmanaged employeeNo (SKM* etc.) — never touched
+    UPDATE,     // cards / group / endTime differ — no enable flip
+    DISABLE,    // austritt set today/past → enable=false
+    REACTIVATE, // austritt cleared → enable=true
+    DELETE,     // orphan — jverein Mitglied truly gone
+    INCOMPLETE, // Hikvision has it + jverein has Mitglied, but no store assignment
+    HIK_ONLY    // non-managed employeeNo (SKM* etc.) — never touched
   }
 
   public static class PlanRow
   {
     public String employeeNo;
     public String name;
-    public String userType;
-    public String groupName;
-    public String groupId;                                          // userGroupNodeID UUID
-    public List<Integer> regionPermissionGroups = new ArrayList<>(); // regionPermissionGroupIDList
+    public String userType;        // normal / visitor / blackList — preserved as-is
+    public String groupName;       // current (Hikvision side)
+    public String groupId;
+    public String desiredGroupName;
+    public String desiredGroupId;
     public List<String> currentCards = new ArrayList<>();
     public List<String> desiredCards = new ArrayList<>();
+    /** Door-access region-permission groups. current = what's on the
+     *  controller's regionPermissionGroupIDList; desired = resolved from the
+     *  member's MitgliedAssignments mapping. Names are carried alongside the
+     *  ids for display / cache. */
+    public List<Integer> currentRegionIds = new ArrayList<>();
+    public List<Integer> desiredRegionIds = new ArrayList<>();
+    public List<String> desiredRegionNames = new ArrayList<>();
+    public boolean currentEnabled = true;
+    public Date currentValidEnd;            // null if Hikvision has no record or far-future sentinel
+    public boolean desiredEnabled = true;
+    public Date desiredValidEnd;            // = austritt, null = no end
     public Status status;
-    public String detail = "";   // human-readable hint (e.g. "neuer Chip", "austritt 2025-01-15")
+    public String detail = "";
     public String jvereinName = "";
   }
 
   public static class Plan
   {
     public final List<PlanRow> rows = new ArrayList<>();
-    public int ok, create, update, delete, hikOnly;
+    public int ok, create, update, disable, reactivate, delete, incomplete, hikOnly;
     public int unknownCards;
     public int membersSkipped;
+    /** Total counts the controller reported during the fetch that built
+     *  this plan. Used by the count-probe drift check on incremental
+     *  refreshes. -1 = not recorded (scoped/legacy plan). */
+    public int userTotal = -1;
+    public int cardTotal = -1;
   }
 
-  /**
-   * Compute the full sync plan WITHOUT touching anything. Used by both
-   * the dry-run preview in the "Hikvision Benutzer" tab AND by the actual
-   * apply path in {@link #run}. Result rows are stable for direct table
-   * rendering — each row is one Hikvision-side employeeNo OR one
-   * to-be-created jverein-side row.
-   */
+  // ============================================================ ISO/Date helpers
+
+  private static final SimpleDateFormat ISO_DT = new SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss");
+  private static final SimpleDateFormat ISO_D  = new SimpleDateFormat("yyyy-MM-dd");
+  /** Hikvision treats any endTime >= this as "no expiry" effectively. */
+  private static final int FAR_FUTURE_YEAR = 2037;
+
+  /** Format jverein Date → Hikvision ISO endTime. Null/far-future → max sentinel. */
+  static String toHikvisionEndTime(Date d)
+  {
+    if (d == null) return "2037-12-31T23:59:59";
+    Calendar cal = Calendar.getInstance();
+    cal.setTime(d);
+    cal.set(Calendar.HOUR_OF_DAY, 23); cal.set(Calendar.MINUTE, 59);
+    cal.set(Calendar.SECOND, 59);       cal.set(Calendar.MILLISECOND, 0);
+    return ISO_DT.format(cal.getTime());
+  }
+
+  /** Parse Hikvision Valid.endTime → Date. Far-future sentinels → null. */
+  static Date parseValidEnd(String s)
+  {
+    if (s == null || s.isEmpty()) return null;
+    try
+    {
+      Date d = ISO_DT.parse(s);
+      Calendar cal = Calendar.getInstance(); cal.setTime(d);
+      if (cal.get(Calendar.YEAR) >= FAR_FUTURE_YEAR) return null;
+      return d;
+    }
+    catch (Exception e)
+    { Logger.warn("Konnte Hikvision endTime nicht parsen: '" + s + "': " + e.getMessage()); return null; }
+  }
+
+  /** Day-level equality so a 23:59:59 vs 00:00:00 mismatch on the same day doesn't trigger UPDATE. */
+  static boolean sameDay(Date a, Date b)
+  {
+    if (a == null && b == null) return true;
+    if (a == null || b == null) return false;
+    return ISO_D.format(a).equals(ISO_D.format(b));
+  }
+
+  /** Load the group catalog (org userGroups + door region-permission
+   *  groups), preferring the authoritative live lists from the controller
+   *  and falling back to the persisted cache if the fetch fails. Saves the
+   *  live result so the Settings / Gruppen / Berechtigungsgruppen views
+   *  stay fresh. */
+  private static HikvisionGroupCatalog loadGroupCatalog(HikvisionClient client,
+      de.jost_net.JVerein.hikvision.ProgressListener pl)
+  {
+    try
+    {
+      JSONArray ug = client.listUserGroups();
+      JSONArray rg = client.listRegionPermissionGroups();
+      HikvisionGroupCatalog cat = HikvisionGroupCatalog.fromControllerLists(ug, rg, System.currentTimeMillis());
+      HikvisionGroupCatalog.save(cat);
+      pl.log("Hikvision Gruppen: " + cat.groups.size() + " Organisationsgruppen, "
+          + cat.regions.size() + " Berechtigungsgruppen geladen");
+      return cat;
+    }
+    catch (Exception e)
+    {
+      pl.log("WARN: Gruppen konnten nicht vom Controller geladen werden ("
+          + e.getClass().getSimpleName() + ": " + e.getMessage() + ") — nutze Cache");
+      return HikvisionGroupCatalog.fromCache();
+    }
+  }
+
+  /** org userGroup name → UUID lookup, for resolving a Mitglied's assigned
+   *  Organisationsgruppe to the controller's userGroupNodeID. */
+  private static Map<String, String> uuidByGroupName(HikvisionGroupCatalog cat)
+  {
+    Map<String, String> m = new HashMap<>();
+    for (HikvisionGroupCatalog.Group g : cat.groups)
+      if (g.name != null && !g.name.isEmpty() && g.uuid != null && !g.uuid.isEmpty())
+        m.put(g.name, g.uuid);
+    return m;
+  }
+
+  /** regionPermissionGroupName → id lookup from a catalog, for resolving a
+   *  Mitglied's assigned Berechtigungsgruppen names to controller ids. */
+  private static Map<String, Integer> regionIdByName(HikvisionGroupCatalog cat)
+  {
+    Map<String, Integer> m = new HashMap<>();
+    for (HikvisionGroupCatalog.RegionPermissionGroup r : cat.regions)
+      if (r.name != null && !r.name.isEmpty()) m.put(r.name, r.id);
+    return m;
+  }
+
+  /** id → regionPermissionGroupName lookup, for rendering current ids. */
+  private static Map<Integer, String> regionNameById(HikvisionGroupCatalog cat)
+  {
+    Map<Integer, String> m = new HashMap<>();
+    for (HikvisionGroupCatalog.RegionPermissionGroup r : cat.regions)
+      m.put(r.id, r.name == null || r.name.isEmpty() ? ("Gruppe " + r.id) : r.name);
+    return m;
+  }
+
+  /** Resolve a member's desired Berechtigungsgruppen names → controller ids.
+   *  Unresolvable names are logged and dropped (never silently granted). */
+  private static List<Integer> resolveRegionIds(List<String> names, Map<String, Integer> idByName,
+      String who, de.jost_net.JVerein.hikvision.ProgressListener pl)
+  {
+    List<Integer> ids = new ArrayList<>();
+    if (names == null) return ids;
+    for (String nm : names)
+    {
+      if (nm == null || nm.trim().isEmpty()) continue;
+      Integer id = idByName.get(nm.trim());
+      if (id == null)
+      { if (pl != null) pl.log("WARN " + who + ": Berechtigungsgruppe '" + nm
+          + "' nicht auflösbar — wird übersprungen"); continue; }
+      if (!ids.contains(id)) ids.add(id);
+    }
+    return ids;
+  }
+
+  // ============================================================ computePlan
+
   public static Plan computePlan(ChipStore chips, HikvisionClient client,
                                  de.jost_net.JVerein.hikvision.ProgressListener pl) throws Exception
   {
     Plan plan = new Plan();
 
-    // Pre-resolve the Felddefinition
-    DBIterator<Felddefinition> defs = Einstellungen.getDBService().createList(Felddefinition.class);
-    defs.addFilter("name = ?", HikvisionSettings.getZusatzfeldName());
-    if (!defs.hasNext())
-      throw new IllegalStateException("Felddefinition '" + HikvisionSettings.getZusatzfeldName()
-          + "' nicht gefunden in jverein");
-    Felddefinition def = (Felddefinition) defs.next();
-    String defId = def.getID();
+    MitgliedAssignments asn = MitgliedAssignments.load();
+    pl.log("MitgliedAssignments: " + asn.size() + " Zuweisungen geladen");
 
-    // Index jverein members: by externe (int-normalized) and by id (for G{id} sponsor lookup later)
+    // Authoritative group lists straight from the controller (org userGroups
+    // + door Berechtigungsgruppen), so groups with no current members are
+    // still resolvable.
+    HikvisionGroupCatalog cat = loadGroupCatalog(client, pl);
+    Map<String, String>  uuidByGroupName = uuidByGroupName(cat);
+    Map<String, Integer> regionIdByName  = regionIdByName(cat);
+    Map<Integer, String> regionNameById  = regionNameById(cat);
+
+    // Index jverein members
     Map<String, Mitglied> jvByExterne = new HashMap<>();
     Map<String, Mitglied> jvById = new HashMap<>();
     DBIterator<Mitglied> jvIt = Einstellungen.getDBService().createList(Mitglied.class);
@@ -143,551 +281,755 @@ public class SyncEngine
     }
     pl.log("jverein: " + jvById.size() + " Mitglieder geladen");
 
-    // Build desired (jverein) state — only active members with chips
+    // Build desired rows from MitgliedAssignments + jverein
     Map<String, PlanRow> desired = new TreeMap<>();
-    for (Mitglied m : jvById.values())
+    for (MitgliedAssignments.Assignment a : asn.all())
     {
-      Date austritt = m.getAustritt();
-      if (austritt != null) { plan.membersSkipped++; continue; }
-
-      String chipsRaw = readZusatzfeld(m.getID(), defId);
-      if (chipsRaw == null || chipsRaw.isEmpty() || chipsRaw.equals("0") || chipsRaw.equalsIgnoreCase("null"))
-      { plan.membersSkipped++; continue; }
-
-      List<String> desiredCards = new ArrayList<>();
-      for (String chip : chipsRaw.split(","))
-      {
-        String c = chip.trim(); if (c.isEmpty()) continue;
-        String cardNo = chips.cardForChip(c);
-        if (cardNo == null) { plan.unknownCards++; pl.log("WARN: chip '" + c + "' (jv_id=" + m.getID()
-            + " " + safe(m.getVorname()) + " " + safe(m.getName()) + ") nicht im ChipStore"); continue; }
-        desiredCards.add(cardNo);
-      }
-      if (desiredCards.isEmpty()) { plan.membersSkipped++; continue; }
+      Mitglied m = jvById.get(a.jvId);
+      if (m == null) continue;     // assignment exists but jverein Mitglied gone — handled in Hikvision-walk
 
       Identity id = Identity.of(m);
       PlanRow row = new PlanRow();
       row.employeeNo = id.employeeNo;
       row.name = (safe(m.getVorname()) + " " + safe(m.getName())).trim();
-      row.userType = id.isSponsor ? "visitor" : "normal";
-      row.groupName = id.isSponsor ? HikvisionSettings.getSponsorGroupName() : HikvisionSettings.getMemberGroupName();
-      row.groupId = id.isSponsor ? HikvisionSettings.getSponsorGroupId() : HikvisionSettings.getMemberGroupId();
-      row.regionPermissionGroups.add(HikvisionSettings.getRegionPermissionGroup());
-      row.desiredCards = desiredCards;
+      row.userType = id.isSponsor ? "visitor" : "normal";    // default; preserved from Hikvision side if record exists
+      // org userGroup: per-member choice from the assignment; falls back to
+      // the default (members → Mitglieder, sponsors → BSV) if unset.
+      String gname = (a.hikvisionGroup != null && !a.hikvisionGroup.isEmpty()) ? a.hikvisionGroup
+          : (id.isSponsor ? HikvisionSettings.getSponsorGroupName() : HikvisionSettings.getMemberGroupName());
+      row.desiredGroupName = gname;
+      row.desiredGroupId = uuidByGroupName.get(gname);   // may be null → resolved/failed in applyCreate
+      // door access = Berechtigungsgruppen mapped per member (default none)
+      row.desiredRegionNames = new ArrayList<>(a.regionPermissionGroups);
+      row.desiredRegionIds = resolveRegionIds(row.desiredRegionNames, regionIdByName,
+          row.name + " (jv_id=" + m.getID() + ")", pl);
+
+      for (String chip : a.transponder)
+      {
+        String cardNo = chips.cardForChip(chip);
+        if (cardNo == null)
+        {
+          plan.unknownCards++;
+          pl.log("WARN: chip '" + chip + "' (jv_id=" + m.getID() + " " + row.name + ") nicht im ChipStore");
+          continue;
+        }
+        row.desiredCards.add(cardNo);
+      }
+
+      // Hikvision Valid semantics: enable=true → enforce time restriction
+      // (deny outside beginTime/endTime); enable=false → no restriction
+      // (always allow, modulo group permissions). For active members we
+      // don't enforce a restriction (desiredValidEnd=null). For departed
+      // members we want enforcement so the controller auto-blocks after
+      // the austritt date.
+      Date austritt = m.getAustritt();
+      row.desiredValidEnd = austritt;
+      row.desiredEnabled = (austritt != null);
       row.jvereinName = row.name;
+
       desired.put(id.employeeNo, row);
     }
-    pl.log("jverein: " + desired.size() + " Mitglieder mit Transponder-Wert");
 
     // Pull Hikvision actual state
     pl.log("Hikvision UserInfo abrufen…");
     JSONArray users = client.listAllUsers(pl);
     pl.log("Hikvision CardInfo abrufen…");
     JSONArray cards = client.listAllCards(pl);
+    plan.userTotal = users.length();
+    plan.cardTotal = cards.length();
 
+    // Index Hikvision data by *canonical* employeeNo so leading-zero
+    // variants (e.g. "0497") match jverein-derived ids ("497"). The
+    // original literal employeeNo is preserved in the UserInfo JSON for
+    // any write operations.
     Map<String, List<String>> cardsByEmp = new HashMap<>();
     for (int i = 0; i < cards.length(); i++)
     {
       JSONObject c = cards.getJSONObject(i);
-      cardsByEmp.computeIfAbsent(c.optString("employeeNo"), k -> new ArrayList<>()).add(c.optString("cardNo"));
+      cardsByEmp.computeIfAbsent(Identity.canonical(c.optString("employeeNo")), k -> new ArrayList<>())
+                .add(c.optString("cardNo"));
     }
 
     Map<String, JSONObject> actualByEmp = new TreeMap<>();
     for (int i = 0; i < users.length(); i++)
     {
       JSONObject u = users.getJSONObject(i);
-      actualByEmp.put(u.optString("employeeNo"), u);
+      actualByEmp.put(Identity.canonical(u.optString("employeeNo")), u);
     }
 
     // Walk every Hikvision entry first (so the table shows everything)
     for (Map.Entry<String, JSONObject> e : actualByEmp.entrySet())
     {
-      String emp = e.getKey();
+      String empCanonical = e.getKey();
       JSONObject u = e.getValue();
-      List<String> cur = cardsByEmp.getOrDefault(emp, new ArrayList<>());
+      String empLiteral = u.optString("employeeNo");   // literal form for writes
+      List<String> cur = cardsByEmp.getOrDefault(empCanonical, new ArrayList<>());
 
-      if (!Identity.isManaged(emp))
+      if (!Identity.isManaged(empCanonical))
       {
-        PlanRow row = new PlanRow();
-        row.employeeNo = emp;
-        row.name = u.optString("name", "");
-        row.userType = u.optString("userType", "");
-        row.groupName = u.optString("userGroupNodeName", "");
-        row.groupId = u.optString("userGroupNodeID", "");
-        copyRegionPermissions(u, row);
-        row.currentCards = cur;
+        PlanRow row = rowFromActual(empLiteral, u, cur);
         row.status = Status.HIK_ONLY;
         row.detail = "unverwalteter employeeNo (z.B. SKM*) — wird bei Sync nie angefasst";
         plan.rows.add(row); plan.hikOnly++;
         continue;
       }
 
-      PlanRow d = desired.remove(emp);
+      PlanRow d = desired.remove(empCanonical);
       if (d == null)
       {
-        // Hikvision-managed entry with no jverein match → would delete
-        PlanRow row = new PlanRow();
-        row.employeeNo = emp;
-        row.name = u.optString("name", "");
-        row.userType = u.optString("userType", "");
-        row.groupName = u.optString("userGroupNodeName", "");
-        row.groupId = u.optString("userGroupNodeID", "");
-        copyRegionPermissions(u, row);
-        row.currentCards = cur;
-        row.status = Status.DELETE;
-
-        // Look up jverein member by emp (numeric ⇒ externe, G… ⇒ id)
-        Mitglied m = null;
-        if (emp.startsWith("G")) m = jvById.get(emp.substring(1));
-        else { try { m = jvByExterne.get(String.valueOf(Integer.parseInt(emp))); } catch (NumberFormatException nfe) {} }
-        if (m != null)
+        // Hikvision-managed entry with no assignment in our store
+        PlanRow row = rowFromActual(empLiteral, u, cur);
+        Mitglied m = lookupByEmp(empCanonical, jvByExterne, jvById);
+        if (m == null)
         {
-          row.jvereinName = (safe(m.getVorname()) + " " + safe(m.getName())).trim();
-          Date austritt = m.getAustritt();
-          if (austritt != null) row.detail = "austritt " + austritt + " — Hikvision-Eintrag noch aktiv";
-          else row.detail = "jverein hat kein Transponder-Wert mehr für dieses Mitglied";
+          row.status = Status.DELETE;
+          row.detail = "kein zugehöriges jverein-Mitglied — verwaister Eintrag";
+          plan.rows.add(row); plan.delete++;
         }
         else
         {
-          row.detail = "kein zugehöriges jverein-Mitglied — verwaister Eintrag";
+          row.status = Status.INCOMPLETE;
+          row.jvereinName = (safe(m.getVorname()) + " " + safe(m.getName())).trim();
+          row.detail = "jverein-Mitglied vorhanden, aber keine MitgliedAssignments-Zuweisung — "
+              + "bitte Migration ausführen oder im UI zuweisen";
+          plan.rows.add(row); plan.incomplete++;
         }
-        plan.rows.add(row); plan.delete++;
         continue;
       }
 
-      // Both sides present — compare cards. Also overwrite the desired-side
-      // group / region fields with the Hikvision-actual values so the row
-      // reflects what's on the controller (used by HikvisionGroupCatalog for
-      // accurate member counts and by the Benutzer table for "real" state).
+      // Overlay actual Hikvision state on the desired row. employeeNo
+      // gets the literal Hikvision value (e.g. "0497") so subsequent
+      // write calls hit the existing record instead of trying to write
+      // to the canonical form ("497") which doesn't exist on the
+      // controller.
+      d.employeeNo = empLiteral;
       d.currentCards = cur;
-      d.groupId = u.optString("userGroupNodeID", d.groupId);
-      d.groupName = u.optString("userGroupNodeName", d.groupName);
-      d.regionPermissionGroups.clear();
-      copyRegionPermissions(u, d);
-
-      Set<String> add = new HashSet<>(d.desiredCards); add.removeAll(cur);
-      Set<String> rem = new HashSet<>(cur); rem.removeAll(d.desiredCards);
-      if (add.isEmpty() && rem.isEmpty())
+      d.groupId = u.optString("userGroupNodeID", "");
+      d.groupName = u.optString("userGroupNodeName", "");
+      d.currentRegionIds = regionIdsOf(u);
+      d.userType = u.optString("userType", d.userType);  // preserve actual (blackList etc.)
+      JSONObject vl = u.optJSONObject("Valid");
+      if (vl != null)
       {
-        d.status = Status.OK;
-        d.detail = "in sync";
-        plan.rows.add(d); plan.ok++;
+        d.currentEnabled = vl.optBoolean("enable", true);
+        d.currentValidEnd = parseValidEnd(vl.optString("endTime", ""));
       }
-      else
+
+      assignStatusAndDetail(d, chips, regionNameById);
+      plan.rows.add(d);
+      switch (d.status)
       {
-        d.status = Status.UPDATE;
-        StringBuilder det = new StringBuilder();
-        if (!add.isEmpty()) det.append("hinzu: ").append(String.join(",", add));
-        if (!rem.isEmpty()) { if (det.length() > 0) det.append("  "); det.append("entfernen: ").append(String.join(",", rem)); }
-        d.detail = det.toString();
-        plan.rows.add(d); plan.update++;
+        case OK:         plan.ok++;         break;
+        case UPDATE:     plan.update++;     break;
+        case DISABLE:    plan.disable++;    break;
+        case REACTIVATE: plan.reactivate++; break;
+        default: break;
       }
     }
 
-    // Anything left in desired → not on Hikvision yet → CREATE
+    // Anything left in desired → CREATE (or skip if no transponder)
     for (PlanRow row : desired.values())
     {
+      if (row.desiredCards.isEmpty())
+      { plan.membersSkipped++; continue; }    // no transponder → no Hikvision record
       row.status = Status.CREATE;
-      row.detail = "neu auf Hikvision anlegen";
+      row.detail = "neu auf Hikvision anlegen — Gruppe " + row.desiredGroupName
+          + ", " + row.desiredCards.size() + " Karte(n)"
+          + (row.desiredRegionNames.isEmpty() ? "" : ", Berechtigung: " + String.join(",", row.desiredRegionNames))
+          + (row.desiredValidEnd != null ? ", endTime=" + ISO_D.format(row.desiredValidEnd) : "");
       plan.rows.add(row); plan.create++;
     }
 
     pl.log("Plan: ok=" + plan.ok + " neu=" + plan.create + " geändert=" + plan.update
-        + " löschen=" + plan.delete + " hik-only=" + plan.hikOnly
+        + " deaktivieren=" + plan.disable + " reaktivieren=" + plan.reactivate
+        + " löschen=" + plan.delete + " unvollständig=" + plan.incomplete
+        + " hik-only=" + plan.hikOnly
         + " | übersprungen=" + plan.membersSkipped + " unbekannte Transponder=" + plan.unknownCards);
-    // Persist for later UI reads — Benutzer tab loads this on open instead of
-    // hitting the controller. Only Aktualisieren/Sync re-fetches.
+
     PlanCache.save(plan);
-    // Also refresh the standalone catalog so the Settings dropdowns are up
-    // to date — they read from HikvisionGroups.json (the lighter file) not
-    // from PlanCache.
-    HikvisionGroupCatalog cat = HikvisionGroupCatalog.fromPlan(plan, System.currentTimeMillis());
-    HikvisionGroupCatalog.annotateRegionNames(cat);
-    HikvisionGroupCatalog.save(cat);
+    // The authoritative group catalog was already fetched + saved by
+    // loadGroupCatalog() above — no plan-derived overwrite needed.
     return plan;
+  }
+
+  // ============================================================ computePlanFor
+
+  /**
+   * Scoped variant of {@link #computePlan}: re-classifies only the given
+   * canonical employeeNos by hitting the Hikvision controller with
+   * {@code EmployeeNoList}-filtered Search calls (typically ~200ms total
+   * vs ~80s for a full refresh on ~560 users). Rows for employeeNos
+   * outside {@code scope} are carried over from {@code cachedBase} unchanged.
+   *
+   * <p>What the caller is expected to seed into {@code scope}:
+   * <ul>
+   *   <li>employeeNos of non-OK rows in the cached plan (still actionable)</li>
+   *   <li>employeeNos derived from recently-edited MitgliedAssignments
+   *       (Identity.of(m).employeeNo, including new-CREATE candidates)</li>
+   *   <li>any specific employeeNos the user asked to refresh
+   *       (e.g. "Sichtbare aktualisieren")</li>
+   * </ul>
+   *
+   * <p>Counter semantics: {@code ok/create/update/...} are recomputed from
+   * the merged row set at the end. {@code unknownCards} reflects only
+   * what was seen in the scoped pass (chips in scope-Assignments with no
+   * ChipStore mapping); it's not carried over from {@code cachedBase}.
+   *
+   * <p>This does NOT touch the {@link MitgliedAssignments#getLastFullRefresh}
+   * marker — only a true full refresh does.
+   */
+  public static Plan computePlanFor(java.util.Set<String> scope, Plan cachedBase,
+      ChipStore chips, HikvisionClient client,
+      de.jost_net.JVerein.hikvision.ProgressListener pl) throws Exception
+  {
+    if (cachedBase == null) throw new IllegalArgumentException("cachedBase required for scoped refresh");
+    if (scope == null || scope.isEmpty())
+    {
+      pl.log("Scoped refresh: leerer Scope — nichts zu tun.");
+      return cachedBase;
+    }
+    pl.log("Scoped refresh: " + scope.size() + " employeeNo(s) werden aktualisiert");
+
+    MitgliedAssignments asn = MitgliedAssignments.load();
+    // Scoped refresh is the fast path — read groups from the cached catalog
+    // (last full refresh / Settings "laden") rather than hitting the
+    // controller. A new region group only needs a full refresh to appear.
+    HikvisionGroupCatalog cat = HikvisionGroupCatalog.fromCache();
+    Map<String, String>  uuidByGroupName = uuidByGroupName(cat);
+    Map<String, Integer> regionIdByName  = regionIdByName(cat);
+    Map<Integer, String> regionNameById  = regionNameById(cat);
+
+    Map<String, Mitglied> jvByExterne = new HashMap<>();
+    Map<String, Mitglied> jvById = new HashMap<>();
+    DBIterator<Mitglied> jvIt = Einstellungen.getDBService().createList(Mitglied.class);
+    while (jvIt.hasNext())
+    {
+      Mitglied m = (Mitglied) jvIt.next();
+      jvById.put(m.getID(), m);
+      String ext = m.getExterneMitgliedsnummer();
+      if (ext != null && !ext.trim().isEmpty())
+      {
+        try { jvByExterne.put(String.valueOf(Integer.parseInt(ext.trim())), m); }
+        catch (NumberFormatException ignored) { jvByExterne.put(ext.trim(), m); }
+      }
+    }
+
+    int scopedUnknownCards = 0;
+    Map<String, PlanRow> desired = new TreeMap<>();
+    for (MitgliedAssignments.Assignment a : asn.all())
+    {
+      Mitglied m = jvById.get(a.jvId);
+      if (m == null) continue;
+      Identity id = Identity.of(m);
+      if (!scope.contains(id.employeeNo)) continue;     // out of scope
+      PlanRow row = new PlanRow();
+      row.employeeNo = id.employeeNo;
+      row.name = (safe(m.getVorname()) + " " + safe(m.getName())).trim();
+      row.userType = id.isSponsor ? "visitor" : "normal";
+      String gname = (a.hikvisionGroup != null && !a.hikvisionGroup.isEmpty()) ? a.hikvisionGroup
+          : (id.isSponsor ? HikvisionSettings.getSponsorGroupName() : HikvisionSettings.getMemberGroupName());
+      row.desiredGroupName = gname;
+      row.desiredGroupId = uuidByGroupName.get(gname);
+      row.desiredRegionNames = new ArrayList<>(a.regionPermissionGroups);
+      row.desiredRegionIds = resolveRegionIds(row.desiredRegionNames, regionIdByName,
+          row.name + " (jv_id=" + m.getID() + ")", pl);
+      for (String chip : a.transponder)
+      {
+        String cardNo = chips.cardForChip(chip);
+        if (cardNo == null)
+        { scopedUnknownCards++;
+          pl.log("WARN: chip '" + chip + "' (jv_id=" + m.getID() + " " + row.name + ") nicht im ChipStore");
+          continue; }
+        row.desiredCards.add(cardNo);
+      }
+      Date austritt = m.getAustritt();
+      row.desiredValidEnd = austritt;
+      row.desiredEnabled = (austritt != null);
+      row.jvereinName = row.name;
+      desired.put(id.employeeNo, row);
+    }
+
+    pl.log("Hikvision UserInfo (scoped) abrufen…");
+    JSONArray users = client.listUsers(scope, pl);
+    pl.log("Hikvision CardInfo (scoped) abrufen…");
+    JSONArray cards = client.listCards(scope, pl);
+
+    Map<String, List<String>> cardsByEmp = new HashMap<>();
+    for (int i = 0; i < cards.length(); i++)
+    {
+      JSONObject c = cards.getJSONObject(i);
+      cardsByEmp.computeIfAbsent(Identity.canonical(c.optString("employeeNo")), k -> new ArrayList<>())
+                .add(c.optString("cardNo"));
+    }
+    Map<String, JSONObject> actualByEmp = new TreeMap<>();
+    for (int i = 0; i < users.length(); i++)
+    {
+      JSONObject u = users.getJSONObject(i);
+      actualByEmp.put(Identity.canonical(u.optString("employeeNo")), u);
+    }
+
+    // Build new rows for every employeeNo in scope (some will end up with
+    // no row at all — see "no row to emit" branch below).
+    Map<String, PlanRow> newRowsByEmp = new java.util.HashMap<>();
+    for (String emp : scope)
+    {
+      JSONObject u = actualByEmp.get(emp);
+      List<String> cur = cardsByEmp.getOrDefault(emp, new ArrayList<>());
+
+      if (u != null)
+      {
+        String empLiteral = u.optString("employeeNo");
+        if (!Identity.isManaged(emp))
+        {
+          PlanRow row = rowFromActual(empLiteral, u, cur);
+          row.status = Status.HIK_ONLY;
+          row.detail = "unverwalteter employeeNo (z.B. SKM*) — wird bei Sync nie angefasst";
+          newRowsByEmp.put(emp, row);
+          continue;
+        }
+        PlanRow d = desired.remove(emp);
+        if (d == null)
+        {
+          PlanRow row = rowFromActual(empLiteral, u, cur);
+          Mitglied m = lookupByEmp(emp, jvByExterne, jvById);
+          if (m == null)
+          { row.status = Status.DELETE;
+            row.detail = "kein zugehöriges jverein-Mitglied — verwaister Eintrag"; }
+          else
+          { row.status = Status.INCOMPLETE;
+            row.jvereinName = (safe(m.getVorname()) + " " + safe(m.getName())).trim();
+            row.detail = "jverein-Mitglied vorhanden, aber keine MitgliedAssignments-Zuweisung — "
+                + "bitte Migration ausführen oder im UI zuweisen"; }
+          newRowsByEmp.put(emp, row);
+          continue;
+        }
+        d.employeeNo = empLiteral;
+        d.currentCards = cur;
+        d.groupId = u.optString("userGroupNodeID", "");
+        d.groupName = u.optString("userGroupNodeName", "");
+        d.currentRegionIds = regionIdsOf(u);
+        d.userType = u.optString("userType", d.userType);
+        JSONObject vl = u.optJSONObject("Valid");
+        if (vl != null)
+        { d.currentEnabled = vl.optBoolean("enable", true);
+          d.currentValidEnd = parseValidEnd(vl.optString("endTime", "")); }
+        assignStatusAndDetail(d, chips, regionNameById);
+        newRowsByEmp.put(emp, d);
+      }
+      else
+      {
+        // No Hikvision record. Either CREATE candidate or no row at all.
+        PlanRow d = desired.remove(emp);
+        if (d == null) continue;                  // emp dropped from both sides — no row
+        if (d.desiredCards.isEmpty()) continue;   // assignment exists but no cards — skip
+        d.status = Status.CREATE;
+        d.detail = "neu auf Hikvision anlegen — Gruppe " + d.desiredGroupName
+            + ", " + d.desiredCards.size() + " Karte(n)"
+            + (d.desiredRegionNames.isEmpty() ? "" : ", Berechtigung: " + String.join(",", d.desiredRegionNames))
+            + (d.desiredValidEnd != null ? ", endTime=" + ISO_D.format(d.desiredValidEnd) : "");
+        newRowsByEmp.put(emp, d);
+      }
+    }
+
+    // Merge: take cachedBase rows, replace any whose employeeNo is in
+    // scope with the new row (or drop if scope yielded no row). Add any
+    // scope rows that weren't previously in cachedBase.
+    Plan merged = new Plan();
+    java.util.Set<String> placed = new java.util.HashSet<>();
+    for (PlanRow r : cachedBase.rows)
+    {
+      String canon = Identity.canonical(r.employeeNo);
+      if (scope.contains(canon))
+      {
+        PlanRow nr = newRowsByEmp.get(canon);
+        if (nr != null) { merged.rows.add(nr); placed.add(canon); }
+        // else: scope refreshed and yielded no row — row is dropped
+      }
+      else
+      {
+        merged.rows.add(r);
+      }
+    }
+    for (Map.Entry<String, PlanRow> e : newRowsByEmp.entrySet())
+      if (!placed.contains(e.getKey())) merged.rows.add(e.getValue());
+
+    // Recompute summary counters
+    for (PlanRow r : merged.rows) tally(merged, r.status);
+    merged.unknownCards = scopedUnknownCards;
+    merged.membersSkipped = cachedBase.membersSkipped;     // not re-derivable from scoped pass
+    merged.userTotal = cachedBase.userTotal;               // last full-refresh totals carry forward
+    merged.cardTotal = cachedBase.cardTotal;
+
+    pl.log("Plan (scoped merge): ok=" + merged.ok + " neu=" + merged.create
+        + " geändert=" + merged.update + " deaktivieren=" + merged.disable
+        + " reaktivieren=" + merged.reactivate + " löschen=" + merged.delete
+        + " unvollständig=" + merged.incomplete + " hik-only=" + merged.hikOnly
+        + " | unbekannte Transponder (Scope)=" + merged.unknownCards);
+
+    PlanCache.save(merged);
+    return merged;
+  }
+
+  private static void tally(Plan p, Status s)
+  {
+    if (s == null) return;
+    switch (s)
+    {
+      case OK:         p.ok++;         break;
+      case CREATE:     p.create++;     break;
+      case UPDATE:     p.update++;     break;
+      case DISABLE:    p.disable++;    break;
+      case REACTIVATE: p.reactivate++; break;
+      case DELETE:     p.delete++;     break;
+      case INCOMPLETE: p.incomplete++; break;
+      case HIK_ONLY:   p.hikOnly++;    break;
+    }
+  }
+
+  /** Decide DISABLE / REACTIVATE / UPDATE / OK for a row where both sides exist.
+   *
+   *  Rules (Hikvision Valid semantics):
+   *  - austritt set → want enable=true + endTime=austritt enforced. If
+   *    already in place → OK (modulo cards/Berechtigung); else DISABLE.
+   *  - no austritt → want NO active block. If Hikvision currently blocks
+   *    via enable=true + past endTime → REACTIVATE; otherwise leave
+   *    enable/endTime alone and treat as OK (modulo cards/Berechtigung).
+   *
+   *  Both the org userGroup ({@code userGroupNodeID}) and the door
+   *  Berechtigungsgruppen ({@code regionPermissionGroupIDList}) are diffed
+   *  here from the per-member assignment and propagated on UPDATE.
+   */
+  private static void assignStatusAndDetail(PlanRow d, ChipStore chips, Map<Integer, String> regionNameById)
+  {
+    Set<String> add = new HashSet<>(d.desiredCards); add.removeAll(d.currentCards);
+    Set<String> rem = new HashSet<>(d.currentCards); rem.removeAll(d.desiredCards);
+    boolean cardsDiffer = !add.isEmpty() || !rem.isEmpty();
+
+    Set<Integer> addR = new HashSet<>(d.desiredRegionIds); addR.removeAll(d.currentRegionIds);
+    Set<Integer> remR = new HashSet<>(d.currentRegionIds); remR.removeAll(d.desiredRegionIds);
+    boolean regionsDiffer = !addR.isEmpty() || !remR.isEmpty();
+
+    boolean groupDiffers = d.desiredGroupId != null && !d.desiredGroupId.isEmpty()
+        && !d.desiredGroupId.equals(d.groupId);
+
+    StringBuilder det = new StringBuilder();
+
+    if (d.desiredValidEnd != null)
+    {
+      // austritt is set — want time restriction enforcing on that day
+      boolean restrictionAlreadyCorrect = d.currentEnabled && sameDay(d.currentValidEnd, d.desiredValidEnd);
+      if (!restrictionAlreadyCorrect)
+      {
+        d.status = Status.DISABLE;
+        det.append("Zugang sperren (endTime → ").append(ISO_D.format(d.desiredValidEnd)).append(")");
+        appendCardDetail(det, add, rem, chips);
+        appendRegionDetail(det, addR, remR, regionNameById);
+        if (groupDiffers) { sep(det); det.append("Gruppe → ").append(d.desiredGroupName); }
+        d.detail = det.toString();
+        return;
+      }
+      // austritt enforcement already in place → fall through to OK/UPDATE
+    }
+    else
+    {
+      // no austritt — check whether Hikvision is blocking via a past endTime
+      java.util.Date today = new java.util.Date();
+      boolean blockedByPastDate = d.currentEnabled && d.currentValidEnd != null
+                                  && d.currentValidEnd.before(today);
+      if (blockedByPastDate)
+      {
+        d.status = Status.REACTIVATE;
+        det.append("Sperre entfernen (endTime ").append(ISO_D.format(d.currentValidEnd)).append(" → unbeschränkt)");
+        appendCardDetail(det, add, rem, chips);
+        appendRegionDetail(det, addR, remR, regionNameById);
+        if (groupDiffers) { sep(det); det.append("Gruppe → ").append(d.desiredGroupName); }
+        d.detail = det.toString();
+        return;
+      }
+    }
+
+    // Neither status-flip case applies → OK or UPDATE based on cards/Berechtigung/Gruppe
+    if (cardsDiffer || regionsDiffer || groupDiffers)
+    {
+      d.status = Status.UPDATE;
+      if (!add.isEmpty()) det.append("hinzu: ").append(renderCardsForDetail(add, chips));
+      if (!rem.isEmpty()) { sep(det); det.append("entfernen: ").append(renderCardsForDetail(rem, chips)); }
+      appendRegionDetail(det, addR, remR, regionNameById);
+      if (groupDiffers) { sep(det); det.append("Gruppe → ").append(d.desiredGroupName); }
+    }
+    else
+    {
+      d.status = Status.OK;
+      det.append("in sync");
+    }
+    d.detail = det.toString();
+  }
+
+  private static void sep(StringBuilder b) { if (b.length() > 0) b.append("  "); }
+
+  private static void appendCardDetail(StringBuilder det, Set<String> add, Set<String> rem, ChipStore chips)
+  {
+    if (!add.isEmpty()) { sep(det); det.append("hinzu: ").append(renderCardsForDetail(add, chips)); }
+    if (!rem.isEmpty()) { sep(det); det.append("entfernen: ").append(renderCardsForDetail(rem, chips)); }
+  }
+
+  private static void appendRegionDetail(StringBuilder det, Set<Integer> addR, Set<Integer> remR,
+      Map<Integer, String> regionNameById)
+  {
+    if (!addR.isEmpty()) { sep(det); det.append("Berechtigung +").append(renderRegions(addR, regionNameById)); }
+    if (!remR.isEmpty()) { sep(det); det.append("Berechtigung −").append(renderRegions(remR, regionNameById)); }
+  }
+
+  private static String renderRegions(java.util.Collection<Integer> ids, Map<Integer, String> regionNameById)
+  {
+    StringBuilder sb = new StringBuilder();
+    for (Integer id : ids)
+    {
+      if (sb.length() > 0) sb.append(",");
+      String nm = regionNameById == null ? null : regionNameById.get(id);
+      sb.append(nm != null ? nm : ("#" + id));
+    }
+    return sb.toString();
+  }
+
+  /** Extract a UserInfo's current regionPermissionGroupIDList as ints. */
+  private static List<Integer> regionIdsOf(JSONObject u)
+  {
+    List<Integer> out = new ArrayList<>();
+    JSONArray a = u.optJSONArray("regionPermissionGroupIDList");
+    if (a != null) for (int i = 0; i < a.length(); i++) out.add(a.optInt(i));
+    return out;
+  }
+
+  /** Render a card-number collection as Transponder ids for human-facing
+   *  detail strings. Unmapped cards (no ChipStore entry) render as
+   *  "Karte #<cardNo>" so they're still identifiable but flagged as
+   *  unknown — same convention as the Benutzer view. */
+  private static String renderCardsForDetail(java.util.Collection<String> cards, ChipStore chips)
+  {
+    if (cards == null || cards.isEmpty()) return "";
+    StringBuilder sb = new StringBuilder();
+    for (String c : cards)
+    {
+      if (sb.length() > 0) sb.append(",");
+      String chip = (chips == null || c == null) ? null : chips.chipForCard(c);
+      sb.append(chip != null ? chip : "Karte #" + c);
+    }
+    return sb.toString();
+  }
+
+  private static PlanRow rowFromActual(String emp, JSONObject u, List<String> cur)
+  {
+    PlanRow row = new PlanRow();
+    row.employeeNo = emp;
+    row.name = u.optString("name", "");
+    row.userType = u.optString("userType", "");
+    row.groupName = u.optString("userGroupNodeName", "");
+    row.groupId = u.optString("userGroupNodeID", "");
+    row.currentRegionIds = regionIdsOf(u);
+    row.currentCards = cur;
+    JSONObject vl = u.optJSONObject("Valid");
+    if (vl != null)
+    {
+      row.currentEnabled = vl.optBoolean("enable", true);
+      row.currentValidEnd = parseValidEnd(vl.optString("endTime", ""));
+    }
+    return row;
+  }
+
+  private static Mitglied lookupByEmp(String emp, Map<String, Mitglied> byExterne, Map<String, Mitglied> byId)
+  {
+    if (emp.startsWith("G")) return byId.get(emp.substring(1));
+    try { return byExterne.get(String.valueOf(Integer.parseInt(emp))); }
+    catch (NumberFormatException nfe) { return null; }
   }
 
   private static String safe(String s) { return s == null ? "" : s; }
 
-  private static void copyRegionPermissions(JSONObject u, PlanRow row)
-  {
-    JSONArray rp = u.optJSONArray("regionPermissionGroupIDList");
-    if (rp != null) for (int i = 0; i < rp.length(); i++) row.regionPermissionGroups.add(rp.optInt(i));
-  }
-
-  /**
-   * Build desired state from jverein + ChipStore. Returns map: employeeNo -> Desired.
-   */
-  public static Map<String, Desired> buildDesired(ChipStore chips, String zusatzfeldName,
-                                                  de.jost_net.JVerein.hikvision.ProgressListener pl, Result r) throws Exception
-  {
-    // Pre-resolve the Felddefinition for the transponder zusatzfeld
-    DBIterator<Felddefinition> defs = Einstellungen.getDBService().createList(Felddefinition.class);
-    defs.addFilter("name = ?", zusatzfeldName);
-    if (!defs.hasNext())
-      throw new IllegalStateException("Felddefinition '" + zusatzfeldName + "' nicht gefunden in jverein");
-    Felddefinition transponderDef = (Felddefinition) defs.next();
-    String transponderDefId = transponderDef.getID();
-
-    Map<String, Desired> desired = new TreeMap<>();
-    DBIterator<Mitglied> it = Einstellungen.getDBService().createList(Mitglied.class);
-    int seen = 0;
-    while (it.hasNext())
-    {
-      Mitglied m = (Mitglied) it.next();
-      seen++;
-
-      // skip departed members
-      Date austritt = m.getAustritt();
-      if (austritt != null) { r.skippedMembers++; continue; }
-
-      // look up the transponder zusatzfeld value
-      String chipsRaw = readZusatzfeld(m.getID(), transponderDefId);
-      if (chipsRaw == null || chipsRaw.isEmpty() || chipsRaw.equals("0") || chipsRaw.equalsIgnoreCase("null"))
-      { r.skippedMembers++; continue; }
-
-      // resolve each chip -> Kartennummer
-      Set<String> cardNos = new HashSet<>();
-      for (String chip : chipsRaw.split(","))
-      {
-        String c = chip.trim();
-        if (c.isEmpty()) continue;
-        String cardNo = chips.cardForChip(c);
-        if (cardNo == null)
-        {
-          r.unknownCards++;
-          pl.log("WARN: chip '" + c + "' (jv_id=" + m.getID() + " " + m.getVorname() + " " + m.getName()
-              + ") nicht in ChipStore — übersprungen");
-          continue;
-        }
-        cardNos.add(cardNo);
-      }
-      if (cardNos.isEmpty()) { r.skippedMembers++; continue; }
-
-      Identity ident = Identity.of(m);
-      String fullName = (m.getVorname() == null ? "" : m.getVorname().trim())
-                      + " " + (m.getName() == null ? "" : m.getName().trim());
-      fullName = fullName.trim();
-      Desired d = new Desired(ident.employeeNo, fullName, ident.isSponsor, m.getID());
-      d.cardNos.addAll(cardNos);
-      desired.put(ident.employeeNo, d);
-    }
-    pl.log("jverein scanned: " + seen + " Mitglieder → desired entries: " + desired.size());
-    return desired;
-  }
-
-  private static String readZusatzfeld(String mitgliedId, String felddefinitionId) throws Exception
-  {
-    DBIterator<Zusatzfelder> it = Einstellungen.getDBService().createList(Zusatzfelder.class);
-    it.addFilter("mitglied = ?", mitgliedId);
-    it.addFilter("felddefinition = ?", felddefinitionId);
-    if (!it.hasNext()) return null;
-    Zusatzfelder z = (Zusatzfelder) it.next();
-    return z.getFeld();
-  }
-
-  public static Map<String, Actual> buildActual(HikvisionClient client, de.jost_net.JVerein.hikvision.ProgressListener pl)
-      throws Exception
-  {
-    pl.log("Hikvision UserInfo abrufen…");
-    JSONArray users = client.listAllUsers(pl);
-    pl.log("Hikvision CardInfo abrufen…");
-    JSONArray cards = client.listAllCards(pl);
-
-    Map<String, Actual> actual = new TreeMap<>();
-    int unmanaged = 0;
-    for (int i = 0; i < users.length(); i++)
-    {
-      JSONObject u = users.getJSONObject(i);
-      String emp = u.optString("employeeNo");
-      if (!Identity.isManaged(emp)) { unmanaged++; continue; }
-      actual.put(emp, new Actual(emp, u.optString("name", "")));
-    }
-    for (int i = 0; i < cards.length(); i++)
-    {
-      JSONObject c = cards.getJSONObject(i);
-      String emp = c.optString("employeeNo");
-      Actual a = actual.get(emp);
-      if (a != null) a.cardNos.add(c.optString("cardNo"));
-    }
-    pl.log("Hikvision: " + actual.size() + " verwaltete Einträge, " + unmanaged + " unverwaltete (SKM* etc. — bleiben unangetastet)");
-    return actual;
-  }
+  // ============================================================ run
 
   public static Result run(boolean dryRun, de.jost_net.JVerein.hikvision.ProgressListener pl) throws Exception
   {
     Result r = new Result();
     r.dryRun = dryRun;
-
     pl.log("=== Sync " + (dryRun ? "(DRY-RUN)" : "(APPLY)") + " ===");
 
     ChipStore chips = ChipStore.defaultStore();
-    pl.log("ChipStore: " + chips.size() + " Chip↔Kartennummer-Einträge geladen");
-
     HikvisionClient client = new HikvisionClient(
         HikvisionSettings.getControllerUrl(), HikvisionSettings.getControllerUser(),
         HikvisionSettings.getControllerPassword(), HikvisionSettings.getInterCallPauseMs(),
         HikvisionSettings.getVerifySsl());
 
-    Map<String, Desired> desired = buildDesired(chips, HikvisionSettings.getZusatzfeldName(), pl, r);
-    Map<String, Actual>  actual  = buildActual(client, pl);
-
-    // Compute diff
-    Set<String> toCreate = new HashSet<>(desired.keySet());
-    toCreate.removeAll(actual.keySet());
-    Set<String> toDelete = new HashSet<>(actual.keySet());
-    toDelete.removeAll(desired.keySet());
-    Set<String> overlap = new HashSet<>(desired.keySet());
-    overlap.retainAll(actual.keySet());
-
-    pl.log("Diff: create=" + toCreate.size()
-        + "  delete=" + toDelete.size()
-        + "  overlap=" + overlap.size());
-
-    int total = toCreate.size() + toDelete.size() + overlap.size();
+    Plan plan = computePlan(chips, client, pl);
+    int total = plan.rows.size();
     int done = 0;
     pl.progress(done, total, "Sync läuft");
 
-    // --- create ---
-    for (String emp : new ArrayList<>(toCreate))
+    for (PlanRow row : plan.rows)
     {
       if (pl.isCancelled()) throw new java.io.InterruptedIOException("Abgebrochen nach " + done + "/" + total);
-      Desired d = desired.get(emp);
-      pl.log("CREATE " + emp + " " + d.name + "  cards=" + d.cardNos);
-      if (!dryRun)
+
+      switch (row.status)
       {
-        boolean okU = client.createUser(emp, d.name,
-            d.isSponsor ? "visitor" : "normal",
-            d.isSponsor ? HikvisionSettings.getSponsorGroupId() : HikvisionSettings.getMemberGroupId(),
-            d.isSponsor ? HikvisionSettings.getSponsorGroupName() : HikvisionSettings.getMemberGroupName(),
-            HikvisionSettings.getRegionPermissionGroup(), "");
-        if (!okU) { r.errors.add("createUser " + emp + " failed"); pl.log("  ! createUser failed"); }
-        else
-        {
-          r.created++;
-          for (String cn : d.cardNos)
-          {
-            boolean okC = client.createCard(emp, cn);
-            if (okC) r.cardsAdded++;
-            else { r.errors.add("createCard " + emp + "/" + cn + " failed"); pl.log("  ! createCard " + cn + " failed"); }
-          }
-        }
+        case OK:
+        case HIK_ONLY:
+        case INCOMPLETE:
+          // no action — INCOMPLETE intentionally requires user intervention
+          break;
+
+        case CREATE:
+          applyCreate(client, row, dryRun, r, pl);
+          break;
+
+        case UPDATE:
+          applyUpdate(client, row, dryRun, r, pl);
+          break;
+
+        case DISABLE:
+          applyDisable(client, row, dryRun, r, pl);
+          applyUpdate(client, row, dryRun, r, pl);   // card/group changes still propagate
+          break;
+
+        case REACTIVATE:
+          applyReactivate(client, row, dryRun, r, pl);
+          applyUpdate(client, row, dryRun, r, pl);
+          break;
+
+        case DELETE:
+          applyDelete(client, row, dryRun, r, pl);
+          break;
       }
+
       pl.progress(++done, total, "Sync läuft");
     }
 
-    // --- delete ---
-    for (String emp : new ArrayList<>(toDelete))
-    {
-      if (pl.isCancelled()) throw new java.io.InterruptedIOException("Abgebrochen nach " + done + "/" + total);
-      Actual a = actual.get(emp);
-      pl.log("DELETE " + emp + " " + a.name + "  cards=" + a.cardNos);
-      if (!dryRun)
-      {
-        for (String cn : a.cardNos)
-        {
-          boolean okC = client.deleteCard(cn);
-          if (okC) r.cardsRemoved++;
-          else { r.errors.add("deleteCard " + cn + " failed"); pl.log("  ! deleteCard " + cn + " failed"); }
-        }
-        boolean okU = client.deleteUser(emp);
-        if (okU) r.deleted++;
-        else { r.errors.add("deleteUser " + emp + " failed"); pl.log("  ! deleteUser failed"); }
-      }
-      pl.progress(++done, total, "Sync läuft");
-    }
+    pl.log("=== DONE === created=" + r.created + " updated=" + r.updated
+        + " disabled=" + r.disabled + " reactivated=" + r.reactivated
+        + " deleted=" + r.deleted + " cardsAdded=" + r.cardsAdded
+        + " cardsRemoved=" + r.cardsRemoved + " groupsChanged=" + r.groupsChanged
+        + " regionsChanged=" + r.regionsChanged
+        + " validChanged=" + r.validChanged + " errors=" + r.errors.size());
 
-    // --- card diff in overlap (note: name/type/group changes NOT handled here) ---
-    for (String emp : new ArrayList<>(overlap))
-    {
-      if (pl.isCancelled()) throw new java.io.InterruptedIOException("Abgebrochen nach " + done + "/" + total);
-      Desired d = desired.get(emp);
-      Actual a = actual.get(emp);
-      Set<String> add = new HashSet<>(d.cardNos); add.removeAll(a.cardNos);
-      Set<String> rem = new HashSet<>(a.cardNos); rem.removeAll(d.cardNos);
-      if (add.isEmpty() && rem.isEmpty()) { pl.progress(++done, total, "Sync läuft"); continue; }
-      pl.log("UPDATE " + emp + " " + d.name + "  +" + add + "  -" + rem);
-      if (!dryRun)
-      {
-        for (String cn : rem) { if (client.deleteCard(cn)) r.cardsRemoved++; else r.errors.add("deleteCard " + cn); }
-        for (String cn : add) { if (client.createCard(emp, cn)) r.cardsAdded++; else r.errors.add("createCard " + emp + "/" + cn); }
-      }
-      pl.progress(++done, total, "Sync läuft");
-    }
-
-    pl.log("=== DONE ===  created=" + r.created + " deleted=" + r.deleted
-        + " cardsAdded=" + r.cardsAdded + " cardsRemoved=" + r.cardsRemoved
-        + " errors=" + r.errors.size());
-    if (!r.errors.isEmpty())
-    {
-      for (String e : r.errors) Logger.warn("sync error: " + e);
-    }
-    // The plan cache reflects pre-apply state; if anything was applied, the
-    // cache no longer matches reality. Drop it so the Benutzer tab knows to
-    // re-fetch (better to be honest than to show stale entries as still-
-    // pending after they were just synced).
-    if (!dryRun && (r.created > 0 || r.deleted > 0 || r.cardsAdded > 0 || r.cardsRemoved > 0))
+    if (!dryRun && (r.created + r.deleted + r.cardsAdded + r.cardsRemoved + r.disabled
+                    + r.reactivated + r.groupsChanged + r.regionsChanged + r.validChanged) > 0)
       PlanCache.invalidate();
     return r;
   }
 
-  // =====================================================================
-  // Reverse-import: Hikvision → jverein (used for bootstrap)
-  // =====================================================================
-
-  public static class ImportResult
+  private static void applyCreate(HikvisionClient c, PlanRow row, boolean dry, Result r,
+                                  de.jost_net.JVerein.hikvision.ProgressListener pl) throws Exception
   {
-    public int membersUpdated;
-    public int membersUnchanged;
-    public int hikvisionUsersUnmatched;
-    public int unknownCards;
-    public boolean dryRun;
-    public final List<String> errors = new ArrayList<>();
+    // Org userGroup is automatic: sponsors → BSV, members → Mitglieder. Keep
+    // gid/gnm a consistent pair — never the old "fallback UUID + desired name"
+    // mix that silently dumped new users into the wrong group.
+    boolean sponsor = "visitor".equals(row.userType);
+    String gid = row.desiredGroupId;
+    String gnm = row.desiredGroupName;
+    if (gid == null || gid.isEmpty())
+    {
+      gid = sponsor ? HikvisionSettings.getSponsorGroupId()   : HikvisionSettings.getMemberGroupId();
+      gnm = sponsor ? HikvisionSettings.getSponsorGroupName() : HikvisionSettings.getMemberGroupName();
+    }
+    if (gid == null || gid.isEmpty())
+    {
+      // No usable userGroup UUID at all — refuse rather than create broken.
+      String msg = "CREATE " + row.employeeNo + " " + row.name
+          + " abgebrochen: keine gültige Organisationsgruppe (UUID fehlt — bitte in den Einstellungen setzen)";
+      pl.log("FEHLER: " + msg); r.errors.add(msg); return;
+    }
+    pl.log("CREATE " + row.employeeNo + " " + row.name + " group=" + gnm
+        + (row.desiredRegionNames.isEmpty() ? "" : " Berechtigung=" + row.desiredRegionNames)
+        + " cards=" + row.desiredCards
+        + " endTime=" + (row.desiredValidEnd == null ? "(none)" : ISO_D.format(row.desiredValidEnd)));
+    if (dry) return;
+    boolean ok = c.createUser(row.employeeNo, row.name, row.userType, gid, gnm,
+        row.desiredEnabled, null, toHikvisionEndTime(row.desiredValidEnd), "", row.desiredRegionIds);
+    if (!ok) { r.errors.add("createUser " + row.employeeNo + " failed"); return; }
+    r.created++;
+    if (!row.desiredRegionIds.isEmpty()) r.regionsChanged++;
+    for (String cn : row.desiredCards)
+    {
+      if (c.createCard(row.employeeNo, cn)) r.cardsAdded++;
+      else r.errors.add("createCard " + row.employeeNo + "/" + cn + " failed");
+    }
   }
 
-  /**
-   * Pulls Hikvision UserInfo + CardInfo and writes the chip list (joined
-   * with ChipStore) into each matched jverein member's transponder
-   * zusatzfeld. Only managed employeeNos (int-parseable or G-prefix) are
-   * considered.
-   *
-   * INTENDED for one-time bootstrap. In steady-state jverein is the source
-   * of truth and the regular {@link #run} sync (jverein → Hikvision) is
-   * what you want.
-   */
-  public static ImportResult importFromHikvision(boolean dryRun, de.jost_net.JVerein.hikvision.ProgressListener pl) throws Exception
+  private static void applyUpdate(HikvisionClient c, PlanRow row, boolean dry, Result r,
+                                  de.jost_net.JVerein.hikvision.ProgressListener pl) throws Exception
   {
-    ImportResult r = new ImportResult();
-    r.dryRun = dryRun;
+    Set<String> add = new HashSet<>(row.desiredCards); add.removeAll(row.currentCards);
+    Set<String> rem = new HashSet<>(row.currentCards); rem.removeAll(row.desiredCards);
+    Set<Integer> addR = new HashSet<>(row.desiredRegionIds); addR.removeAll(row.currentRegionIds);
+    Set<Integer> remR = new HashSet<>(row.currentRegionIds); remR.removeAll(row.desiredRegionIds);
+    boolean regionsDiffer = !addR.isEmpty() || !remR.isEmpty();
+    boolean groupDiffers = row.desiredGroupId != null && !row.desiredGroupId.isEmpty()
+        && !row.desiredGroupId.equals(row.groupId);
 
-    pl.log("=== Import " + (dryRun ? "(DRY-RUN)" : "(APPLY)") + " ===");
+    if (!add.isEmpty() || !rem.isEmpty())
+      pl.log("UPDATE-cards " + row.employeeNo + " +" + add + " -" + rem);
+    if (groupDiffers)
+      pl.log("UPDATE-Gruppe " + row.employeeNo + " " + row.groupName + " → " + row.desiredGroupName);
+    if (regionsDiffer)
+      pl.log("UPDATE-Berechtigung " + row.employeeNo + " soll=" + row.desiredRegionIds
+          + " ist=" + row.currentRegionIds);
 
-    ChipStore chips = ChipStore.defaultStore();
-    pl.log("ChipStore: " + chips.size() + " Chip↔Kartennummer-Einträge geladen");
+    if (dry) return;
 
-    HikvisionClient client = new HikvisionClient(
-        HikvisionSettings.getControllerUrl(), HikvisionSettings.getControllerUser(),
-        HikvisionSettings.getControllerPassword(), HikvisionSettings.getInterCallPauseMs(),
-        HikvisionSettings.getVerifySsl());
+    for (String cn : rem)
+    { if (c.deleteCard(cn)) r.cardsRemoved++; else r.errors.add("deleteCard " + cn + " failed"); }
+    for (String cn : add)
+    { if (c.createCard(row.employeeNo, cn)) r.cardsAdded++; else r.errors.add("createCard " + row.employeeNo + "/" + cn + " failed"); }
 
-    pl.log("Hikvision UserInfo abrufen…");
-    JSONArray users = client.listAllUsers(pl);
-    pl.log("Hikvision CardInfo abrufen…");
-    JSONArray cards = client.listAllCards(pl);
-
-    // group cards by employeeNo
-    Map<String, List<String>> cardsByEmp = new HashMap<>();
-    for (int i = 0; i < cards.length(); i++)
+    if (groupDiffers)
     {
-      JSONObject c = cards.getJSONObject(i);
-      String emp = c.optString("employeeNo");
-      cardsByEmp.computeIfAbsent(emp, k -> new ArrayList<>()).add(c.optString("cardNo"));
+      if (c.setUserGroup(row.employeeNo, row.desiredGroupId, row.desiredGroupName)) r.groupsChanged++;
+      else r.errors.add("setUserGroup " + row.employeeNo + " failed");
     }
 
-    // index jverein members by externe (int-normalized) and by jv_id (for G-prefix)
-    Map<String, Mitglied> byExterne = new HashMap<>();
-    Map<String, Mitglied> byId = new HashMap<>();
-    DBIterator<Mitglied> it = Einstellungen.getDBService().createList(Mitglied.class);
-    while (it.hasNext())
+    if (regionsDiffer)
     {
-      Mitglied m = (Mitglied) it.next();
-      byId.put(m.getID(), m);
-      String ext = m.getExterneMitgliedsnummer();
-      if (ext != null && !ext.trim().isEmpty())
-      {
-        try { byExterne.put(String.valueOf(Integer.parseInt(ext.trim())), m); }
-        catch (NumberFormatException ignore) { byExterne.put(ext.trim(), m); }
-      }
+      // Replace the full desired set (adds + removes in one call).
+      if (c.setUserRegionPermissionGroups(row.employeeNo, row.desiredRegionIds)) r.regionsChanged++;
+      else r.errors.add("setUserRegionPermissionGroups " + row.employeeNo + " failed");
     }
 
-    // pre-resolve the Felddefinition
-    DBIterator<Felddefinition> defs = Einstellungen.getDBService().createList(Felddefinition.class);
-    defs.addFilter("name = ?", HikvisionSettings.getZusatzfeldName());
-    if (!defs.hasNext())
-      throw new IllegalStateException("Felddefinition '" + HikvisionSettings.getZusatzfeldName() + "' nicht gefunden in jverein");
-    Felddefinition transponderDef = (Felddefinition) defs.next();
-    String transponderDefId = transponderDef.getID();
-
-    int total = users.length(), done = 0;
-    for (int i = 0; i < users.length(); i++)
-    {
-      if (pl.isCancelled()) throw new java.io.InterruptedIOException("Abgebrochen nach " + done + "/" + total);
-      JSONObject u = users.getJSONObject(i);
-      String emp = u.optString("employeeNo");
-      done++; pl.progress(done, total, "Import läuft");
-
-      if (!Identity.isManaged(emp)) continue;
-
-      Mitglied member;
-      if (emp.startsWith("G")) member = byId.get(emp.substring(1));
-      else
-      {
-        try { member = byExterne.get(String.valueOf(Integer.parseInt(emp))); }
-        catch (NumberFormatException nfe) { member = byExterne.get(emp); }
-      }
-      if (member == null)
-      {
-        r.hikvisionUsersUnmatched++;
-        pl.log("kein jverein-Match für employeeNo=" + emp + " (" + u.optString("name") + ")");
-        continue;
-      }
-
-      // resolve each cardNo -> chip via ChipStore
-      List<String> userCards = cardsByEmp.getOrDefault(emp, new ArrayList<>());
-      List<String> resolvedChips = new ArrayList<>();
-      for (String cardNo : userCards)
-      {
-        String chip = chips.chipForCard(cardNo);
-        if (chip == null)
-        {
-          r.unknownCards++;
-          pl.log("WARN: Kartennummer " + cardNo + " (emp=" + emp + " " + u.optString("name")
-              + ") nicht im ChipStore — übersprungen");
-          continue;
-        }
-        resolvedChips.add(chip);
-      }
-      String proposed = String.join(",", resolvedChips);
-      String current = readZusatzfeld(member.getID(), transponderDefId);
-      if (current == null) current = "";
-      if (current.equals(proposed)) { r.membersUnchanged++; continue; }
-
-      pl.log("UPDATE jv_id=" + member.getID() + " " + member.getVorname() + " " + member.getName()
-          + ": '" + current + "' → '" + proposed + "'");
-      if (!dryRun)
-      {
-        try { writeZusatzfeld(member.getID(), transponderDef, proposed); r.membersUpdated++; }
-        catch (Exception e) { r.errors.add("write jv_id=" + member.getID() + ": " + e.getMessage()); }
-      }
-      else
-      {
-        r.membersUpdated++;   // counted as "would update" in dry-run
-      }
-    }
-
-    pl.log("=== DONE ===  updated=" + r.membersUpdated
-        + " unchanged=" + r.membersUnchanged
-        + " hikUnmatched=" + r.hikvisionUsersUnmatched
-        + " unknownCards=" + r.unknownCards
-        + " errors=" + r.errors.size());
-    return r;
+    if (row.status == Status.UPDATE) r.updated++;
   }
 
-  /** Find-or-create the Zusatzfelder row for (mitglied, felddefinition) and write the string value. */
-  private static void writeZusatzfeld(String mitgliedId, Felddefinition def, String value) throws Exception
+  /** Apply DISABLE = enforce a time restriction ending on austritt date.
+   *  Sets enable=true (turn ON the time check) + endTime=austritt. Cards
+   *  stay attached so swipe history is preserved. */
+  private static void applyDisable(HikvisionClient c, PlanRow row, boolean dry, Result r,
+                                   de.jost_net.JVerein.hikvision.ProgressListener pl) throws Exception
   {
-    DBIterator<Zusatzfelder> it = Einstellungen.getDBService().createList(Zusatzfelder.class);
-    it.addFilter("mitglied = ?", mitgliedId);
-    it.addFilter("felddefinition = ?", def.getID());
-    Zusatzfelder z;
-    if (it.hasNext()) z = (Zusatzfelder) it.next();
-    else
-    {
-      z = (Zusatzfelder) Einstellungen.getDBService().createObject(Zusatzfelder.class, null);
-      z.setMitglied(Integer.parseInt(mitgliedId));
-      z.setFelddefinition(Integer.parseInt(def.getID()));
-    }
-    z.setFeld(value == null || value.isEmpty() ? null : value);
-    z.store();
+    pl.log("DISABLE " + row.employeeNo + " " + row.name
+        + " — enforce endTime=" + (row.desiredValidEnd == null ? "?" : ISO_D.format(row.desiredValidEnd)));
+    if (dry) return;
+    if (c.setUserValid(row.employeeNo, true, toHikvisionEndTime(row.desiredValidEnd)))
+    { r.disabled++; r.validChanged++; }
+    else r.errors.add("setUserValid(disable) " + row.employeeNo + " failed");
+  }
+
+  /** Apply REACTIVATE = remove a stale time restriction left over from a
+   *  previous austritt. Sets enable=false (no time check). */
+  private static void applyReactivate(HikvisionClient c, PlanRow row, boolean dry, Result r,
+                                      de.jost_net.JVerein.hikvision.ProgressListener pl) throws Exception
+  {
+    pl.log("REACTIVATE " + row.employeeNo + " " + row.name + " — remove time restriction");
+    if (dry) return;
+    if (c.setUserValid(row.employeeNo, false, null))
+    { r.reactivated++; r.validChanged++; }
+    else r.errors.add("setUserValid(enable=false) " + row.employeeNo + " failed");
+  }
+
+  private static void applyDelete(HikvisionClient c, PlanRow row, boolean dry, Result r,
+                                  de.jost_net.JVerein.hikvision.ProgressListener pl) throws Exception
+  {
+    pl.log("DELETE " + row.employeeNo + " " + row.name + " (orphan)");
+    if (dry) return;
+    for (String cn : row.currentCards)
+    { if (c.deleteCard(cn)) r.cardsRemoved++; else r.errors.add("deleteCard " + cn + " failed"); }
+    if (c.deleteUser(row.employeeNo)) r.deleted++;
+    else r.errors.add("deleteUser " + row.employeeNo + " failed");
   }
 }

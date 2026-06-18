@@ -57,9 +57,17 @@ public final class PlanCache
         o.put("userType", n(r.userType));
         o.put("groupName", n(r.groupName));
         o.put("groupId", n(r.groupId));
-        o.put("regionPermissionGroups", new JSONArray(r.regionPermissionGroups));
+        o.put("desiredGroupName", n(r.desiredGroupName));
+        o.put("desiredGroupId", n(r.desiredGroupId));
         o.put("currentCards", new JSONArray(r.currentCards));
         o.put("desiredCards", new JSONArray(r.desiredCards));
+        o.put("currentRegionIds", new JSONArray(r.currentRegionIds));
+        o.put("desiredRegionIds", new JSONArray(r.desiredRegionIds));
+        o.put("desiredRegionNames", new JSONArray(r.desiredRegionNames));
+        o.put("currentEnabled", r.currentEnabled);
+        o.put("desiredEnabled", r.desiredEnabled);
+        o.put("currentValidEnd", r.currentValidEnd == null ? "" : r.currentValidEnd.getTime());
+        o.put("desiredValidEnd", r.desiredValidEnd == null ? "" : r.desiredValidEnd.getTime());
         o.put("detail", n(r.detail));
         o.put("jvereinName", n(r.jvereinName));
         rows.put(o);
@@ -69,10 +77,15 @@ public final class PlanCache
       root.put("ok", plan.ok);
       root.put("create", plan.create);
       root.put("update", plan.update);
+      root.put("disable", plan.disable);
+      root.put("reactivate", plan.reactivate);
       root.put("delete", plan.delete);
+      root.put("incomplete", plan.incomplete);
       root.put("hikOnly", plan.hikOnly);
       root.put("unknownCards", plan.unknownCards);
       root.put("membersSkipped", plan.membersSkipped);
+      root.put("userTotal", plan.userTotal);
+      root.put("cardTotal", plan.cardTotal);
       root.put("rows", rows);
 
       File tmp = new File(f.getParentFile(), f.getName() + ".tmp");
@@ -101,10 +114,15 @@ public final class PlanCache
       c.plan.ok = root.optInt("ok", 0);
       c.plan.create = root.optInt("create", 0);
       c.plan.update = root.optInt("update", 0);
+      c.plan.disable = root.optInt("disable", 0);
+      c.plan.reactivate = root.optInt("reactivate", 0);
       c.plan.delete = root.optInt("delete", 0);
+      c.plan.incomplete = root.optInt("incomplete", 0);
       c.plan.hikOnly = root.optInt("hikOnly", 0);
       c.plan.unknownCards = root.optInt("unknownCards", 0);
       c.plan.membersSkipped = root.optInt("membersSkipped", 0);
+      c.plan.userTotal = root.optInt("userTotal", -1);
+      c.plan.cardTotal = root.optInt("cardTotal", -1);
       JSONArray rows = root.optJSONArray("rows");
       if (rows != null) for (int i = 0; i < rows.length(); i++)
       {
@@ -118,12 +136,21 @@ public final class PlanCache
         r.userType = o.optString("userType", "");
         r.groupName = o.optString("groupName", "");
         r.groupId = o.optString("groupId", "");
+        r.desiredGroupName = o.optString("desiredGroupName", "");
+        r.desiredGroupId = o.optString("desiredGroupId", "");
         r.detail = o.optString("detail", "");
         r.jvereinName = o.optString("jvereinName", "");
         r.currentCards = toList(o.optJSONArray("currentCards"));
         r.desiredCards = toList(o.optJSONArray("desiredCards"));
-        JSONArray rp = o.optJSONArray("regionPermissionGroups");
-        if (rp != null) for (int k = 0; k < rp.length(); k++) r.regionPermissionGroups.add(rp.optInt(k));
+        r.currentRegionIds = toIntList(o.optJSONArray("currentRegionIds"));
+        r.desiredRegionIds = toIntList(o.optJSONArray("desiredRegionIds"));
+        r.desiredRegionNames = toList(o.optJSONArray("desiredRegionNames"));
+        r.currentEnabled = o.optBoolean("currentEnabled", true);
+        r.desiredEnabled = o.optBoolean("desiredEnabled", true);
+        long cve = o.optLong("currentValidEnd", 0);
+        if (cve > 0) r.currentValidEnd = new java.util.Date(cve);
+        long dve = o.optLong("desiredValidEnd", 0);
+        if (dve > 0) r.desiredValidEnd = new java.util.Date(dve);
         c.plan.rows.add(r);
       }
       return c;
@@ -147,6 +174,14 @@ public final class PlanCache
     java.util.List<String> out = new ArrayList<>();
     if (a == null) return out;
     for (int i = 0; i < a.length(); i++) out.add(a.optString(i, ""));
+    return out;
+  }
+
+  private static java.util.List<Integer> toIntList(JSONArray a)
+  {
+    java.util.List<Integer> out = new ArrayList<>();
+    if (a == null) return out;
+    for (int i = 0; i < a.length(); i++) out.add(a.optInt(i));
     return out;
   }
 

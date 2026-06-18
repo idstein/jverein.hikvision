@@ -20,6 +20,7 @@ import org.json.JSONObject;
 import de.jost_net.JVerein.hikvision.HikvisionClient;
 import de.jost_net.JVerein.hikvision.HikvisionGroupCatalog;
 import de.jost_net.JVerein.hikvision.HikvisionSettings;
+import de.jost_net.JVerein.hikvision.MitgliedAssignments;
 import de.jost_net.JVerein.hikvision.PlanCache;
 import de.jost_net.JVerein.hikvision.ProgressListener;
 import de.jost_net.JVerein.hikvision.SyncEngine;
@@ -59,18 +60,17 @@ public class SettingsView implements Extension
 
   private SelectInput memberGroupSelect;
   private SelectInput sponsorGroupSelect;
-  private SelectInput regionPermissionSelect;
   private TextInput memberGroupIdFallback;
   private TextInput memberGroupNameFallback;
   private TextInput sponsorGroupIdFallback;
   private TextInput sponsorGroupNameFallback;
-  private IntegerInput regionPermissionFallback;
 
   private TextInput zusatzfeldName;
   private IntegerInput interCallPauseMs;
   private LabelInput statusLabel;
   private Button testBtn;
   private Button fetchBtn;
+  private Button migrateBtn;
 
   private HikvisionGroupCatalog catalog;
   private MessageConsumer consumer;
@@ -142,21 +142,10 @@ public class SettingsView implements Extension
       tab.addLabelPair("Sponsor Gruppen-Name", sponsorGroupNameFallback);
     }
 
-    boolean haveRegions = catalog != null && !catalog.regions.isEmpty();
-    if (haveRegions)
-    {
-      regionPermissionSelect = makeRegionSelect(HikvisionSettings.getRegionPermissionGroup());
-      tab.addLabelPair("Region-Permission (Türrechte)", regionPermissionSelect);
-    }
-    else
-    {
-      regionPermissionFallback = new IntegerInput(HikvisionSettings.getRegionPermissionGroup());
-      tab.addLabelPair("Region-Permission-Gruppe (Türrechte)", regionPermissionFallback);
-    }
-
-    statusLabel = new LabelInput(haveCatalog || haveRegions
+    boolean haveAny = catalog != null && (!catalog.groups.isEmpty() || !catalog.regions.isEmpty());
+    statusLabel = new LabelInput(haveAny
         ? "Aus Cache vom " + formatStamp(catalog.timestamp) + "  ·  "
-            + catalog.groups.size() + " Gruppen, " + catalog.regions.size() + " Region-Permissions"
+            + catalog.groups.size() + " Organisationsgruppen, " + catalog.regions.size() + " Berechtigungsgruppen"
         : "Noch kein Cache. Klicke 'Aus Hikvision laden' um Auswahllisten zu füllen.");
     tab.addLabelPair("Status", statusLabel);
 
@@ -175,10 +164,28 @@ public class SettingsView implements Extension
     });
 
     fetchBtn = new Button(btnRow, SWT.PUSH);
-    fetchBtn.setText("Gruppen + Türrechte aus Hikvision laden");
+    fetchBtn.setText("Gruppen aus Hikvision laden");
     fetchBtn.setLayoutData(new GridData(SWT.FILL, SWT.CENTER, true, false));
     fetchBtn.addSelectionListener(new SelectionAdapter() {
       @Override public void widgetSelected(SelectionEvent e) { onFetch(); }
+    });
+
+    // ----- Mirror sync between jverein Zusatzfeld and MitgliedAssignments
+    // Both flows are idempotent (running twice gives the same result).
+    Composite migRow = new Composite(tab.getComposite(), SWT.NONE);
+    migRow.setLayoutData(new GridData(SWT.FILL, SWT.CENTER, true, false, 2, 1));
+    migRow.setLayout(new GridLayout(2, true));
+    migrateBtn = new Button(migRow, SWT.PUSH);
+    migrateBtn.setText("Von Zusatzfeld importieren");
+    migrateBtn.setLayoutData(new GridData(SWT.FILL, SWT.CENTER, true, false));
+    migrateBtn.addSelectionListener(new SelectionAdapter() {
+      @Override public void widgetSelected(SelectionEvent e) { onMigrate(); }
+    });
+    Button writeBackBtn = new Button(migRow, SWT.PUSH);
+    writeBackBtn.setText("Zu Zusatzfeld exportieren");
+    writeBackBtn.setLayoutData(new GridData(SWT.FILL, SWT.CENTER, true, false));
+    writeBackBtn.addSelectionListener(new SelectionAdapter() {
+      @Override public void widgetSelected(SelectionEvent e) { onWriteBackZusatzfeld(); }
     });
   }
 
@@ -188,15 +195,6 @@ public class SettingsView implements Extension
     HikvisionGroupCatalog.Group preselect = null;
     for (HikvisionGroupCatalog.Group g : items)
     { if (g.uuid != null && g.uuid.equals(currentUuid)) { preselect = g; break; } }
-    return new SelectInput(items.toArray(), preselect);
-  }
-
-  private SelectInput makeRegionSelect(int currentId)
-  {
-    List<HikvisionGroupCatalog.RegionPermissionGroup> items = new ArrayList<>(catalog.regions);
-    HikvisionGroupCatalog.RegionPermissionGroup preselect = null;
-    for (HikvisionGroupCatalog.RegionPermissionGroup g : items)
-    { if (g.id == currentId) { preselect = g; break; } }
     return new SelectInput(items.toArray(), preselect);
   }
 
@@ -239,9 +237,10 @@ public class SettingsView implements Extension
   }
 
   /**
-   * Fetches UserInfo + CardInfo from Hikvision so the Settings dropdowns
-   * can be populated in-place. Writes a full PlanCache as a side effect
-   * so the other views (Benutzer / Gruppen / Türrechte) also benefit.
+   * Fetches the controller's group lists (org userGroups +
+   * Berechtigungsgruppen) so the Settings dropdowns can be populated
+   * in-place. Saves the group catalog so the other views (Benutzer /
+   * Organisationsgruppen / Berechtigungsgruppen) also benefit.
    */
   private void onFetch()
   {
@@ -277,7 +276,7 @@ public class SettingsView implements Extension
             });
         Display.getDefault().asyncExec(() -> {
           showInfo("Hikvision geladen",
-              c.groups.size() + " Gruppen, " + c.regions.size() + " Region-Permissions geladen.\n"
+              c.groups.size() + " Organisationsgruppen, " + c.regions.size() + " Berechtigungsgruppen geladen.\n"
               + "Bitte den Dialog schliessen und erneut öffnen, damit die Auswahllisten erscheinen.");
           if (statusLabel != null)
             statusLabel.setValue("Aktualisiert. Dialog schliessen + neu öffnen, um Dropdowns zu sehen.");
@@ -297,6 +296,107 @@ public class SettingsView implements Extension
       }
     }, "jverein.hikvision-settings-fetch");
     t.setDaemon(true); t.start();
+  }
+
+  /**
+   * Flow (a): full rebuild of {@code MitgliedAssignments.json} from the
+   * jverein Zusatzfeld + latest Hikvision PlanCache. Idempotent —
+   * existing entries are overwritten with what jverein + cache say.
+   * Manual edits to the assignment store (group choice via the dialog)
+   * are lost; the canonical source after this is the Zusatzfeld + cache.
+   */
+  private void onMigrate()
+  {
+    MessageBox confirm = new MessageBox(GUI.getShell(), SWT.ICON_QUESTION | SWT.YES | SWT.NO);
+    confirm.setText("Von Zusatzfeld importieren");
+    confirm.setMessage("Liest für jedes aktive Mitglied das Zusatzfeld '"
+        + HikvisionSettings.getZusatzfeldName() + "' (Transponder) und übernimmt aus dem "
+        + "letzten Hikvision-Aktualisierungslauf die aktuelle Gruppenzuordnung.\n\n"
+        + "ÜBERSCHREIBT bestehende Einträge in MitgliedAssignments — manuelle "
+        + "Gruppen- oder Transponder-Änderungen aus dem Dialog werden zurückgesetzt.\n"
+        + "Das jverein-Zusatzfeld bleibt unverändert.\n\n"
+        + "Idempotent — kann gefahrlos mehrfach ausgeführt werden.\n\nFortfahren?");
+    if (confirm.open() != SWT.YES) return;
+
+    migrateBtn.setEnabled(false);
+    Thread t = new Thread(() -> {
+      try
+      {
+        MitgliedAssignments.MigrationResult r = MitgliedAssignments.migrateFromZusatzfeld(true,
+            new ProgressListener() {
+              @Override public void log(String msg) { Logger.info(msg); }
+              @Override public void progress(int done, int total) {}
+              @Override public void progress(int done, int total, String phase) {}
+            });
+        StringBuilder sb = new StringBuilder();
+        sb.append("Im Store: ").append(r.totalInStore).append(" Zuweisungen\n");
+        sb.append("Neu angelegt: ").append(r.created).append("\n");
+        sb.append("Aktualisiert: ").append(r.updated).append("\n");
+        sb.append("Unverändert (bereits vorhanden): ").append(r.unchanged).append("\n");
+        sb.append("Mit Hikvision-Cache abgeglichen: ").append(r.matchedFromHikvision).append("\n");
+        sb.append("Default Mitglieder: ").append(r.defaultedActive).append("\n");
+        sb.append("Default Sponsor: ").append(r.defaultedSponsor).append("\n");
+        sb.append("Austritt-Mitglieder mit Hikvision-Record (für DISABLE): ").append(r.includedDeparted).append("\n");
+        sb.append("Übersprungen (kein Transponder + kein Hikvision-Record): ").append(r.skippedNoRelevance).append("\n");
+        sb.append("Orphan-Einträge entfernt (jvId nicht mehr in jverein): ").append(r.orphansRemoved).append("\n");
+        if (!r.planCacheAvailable)
+          sb.append("\nHINWEIS: kein PlanCache gefunden — alle Gruppen sind Defaults. "
+              + "Erst in Benutzer-Ansicht 'Aktualisieren' klicken und Migration erneut ausführen.");
+        sb.append("\n\nDatei: ").append(MitgliedAssignments.defaultFile().getAbsolutePath());
+        showInfo("Migration abgeschlossen", sb.toString());
+      }
+      catch (Exception e)
+      {
+        Logger.error("MitgliedAssignments migration failed", e);
+        showError("Migration fehlgeschlagen", e.getClass().getSimpleName() + ": " + e.getMessage());
+      }
+      finally
+      {
+        Display.getDefault().asyncExec(() -> {
+          if (migrateBtn != null && !migrateBtn.isDisposed()) migrateBtn.setEnabled(true);
+        });
+      }
+    }, "jverein.hikvision-migrate-assignments");
+    t.setDaemon(true); t.start();
+  }
+
+  /**
+   * Bulk mirror: walks every active jverein Mitglied and writes their
+   * MitgliedAssignments transponder list to the jverein Zusatzfeld
+   * (clearing the field for Mitglieder no longer in the store). Useful
+   * after a migration or one-off store edits to bring the jverein UI
+   * back in sync without going through individual saves.
+   */
+  private void onWriteBackZusatzfeld()
+  {
+    MessageBox confirm = new MessageBox(GUI.getShell(), SWT.ICON_QUESTION | SWT.YES | SWT.NO);
+    confirm.setText("Zu Zusatzfeld exportieren");
+    confirm.setMessage("Überschreibt das Zusatzfeld '" + HikvisionSettings.getZusatzfeldName()
+        + "' jeder aktiven jverein-Mitgliedschaft mit dem aktuellen Transponder-Inhalt aus "
+        + "MitgliedAssignments. Mitglieder ohne Zuweisung bekommen das Feld geleert.\n\n"
+        + "Idempotent — kann gefahrlos mehrfach ausgeführt werden.\n\nFortfahren?");
+    if (confirm.open() != SWT.YES) return;
+
+    new Thread(() -> {
+      try
+      {
+        de.jost_net.JVerein.hikvision.MitgliedAssignments store =
+            de.jost_net.JVerein.hikvision.MitgliedAssignments.load();
+        int wrote = store.syncAllToZusatzfeld(new ProgressListener() {
+          @Override public void log(String msg) { Logger.info(msg); }
+          @Override public void progress(int done, int total) {}
+          @Override public void progress(int done, int total, String phase) {}
+        });
+        showInfo("Rückschreiben abgeschlossen",
+            wrote + " jverein-Zusatzfelder aktualisiert.\n"
+            + "(Werte die bereits übereinstimmten, wurden nicht angefasst.)");
+      }
+      catch (Exception ex)
+      {
+        Logger.error("Zusatzfeld Rückschreiben fehlgeschlagen", ex);
+        showError("Rückschreiben fehlgeschlagen", ex.getClass().getSimpleName() + ": " + ex.getMessage());
+      }
+    }, "jverein.hikvision-writeback-zusatzfeld").start();
   }
 
   /** Save URL / user / password / verifySsl right now so test+fetch use them. */
@@ -366,18 +466,6 @@ public class SettingsView implements Extension
       {
         HikvisionSettings.setSponsorGroupId((String) sponsorGroupIdFallback.getValue());
         HikvisionSettings.setSponsorGroupName((String) sponsorGroupNameFallback.getValue());
-      }
-
-      if (regionPermissionSelect != null)
-      {
-        Object v = regionPermissionSelect.getValue();
-        if (v instanceof HikvisionGroupCatalog.RegionPermissionGroup)
-          HikvisionSettings.setRegionPermissionGroup(((HikvisionGroupCatalog.RegionPermissionGroup) v).id);
-      }
-      else if (regionPermissionFallback != null)
-      {
-        Object rpg = regionPermissionFallback.getValue();
-        if (rpg instanceof Integer) HikvisionSettings.setRegionPermissionGroup((Integer) rpg);
       }
 
       HikvisionSettings.setZusatzfeldName((String) zusatzfeldName.getValue());

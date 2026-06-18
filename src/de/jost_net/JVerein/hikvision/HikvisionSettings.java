@@ -66,12 +66,6 @@ public class HikvisionSettings
   }
   public static void setSponsorGroupName(String s) { SETTINGS.setAttribute("sponsor.groupName", s); }
 
-  public static int getRegionPermissionGroup()
-  {
-    return SETTINGS.getInt("region.permissionGroup", 3);
-  }
-  public static void setRegionPermissionGroup(int n) { SETTINGS.setAttribute("region.permissionGroup", n); }
-
   // -- name of the transponder Zusatzfeld --
   public static String getZusatzfeldName()
   {
@@ -100,23 +94,6 @@ public class HikvisionSettings
     return SETTINGS.getBoolean("controller.verifySsl", false);
   }
   public static void setVerifySsl(boolean b) { SETTINGS.setAttribute("controller.verifySsl", b); }
-
-  // -- region-permission-group naming --
-  // Hikvision DS-K firmware doesn't expose the Permission Group display
-  // names via ISAPI (they only live in the controller's web UI). We store
-  // a user-set name per region id locally so the Türrechte view and the
-  // Settings dropdown can show meaningful labels.
-
-  public static String getRegionName(int id)
-  { return SETTINGS.getString("region.name." + id, ""); }
-
-  public static void setRegionName(int id, String name)
-  {
-    if (name == null || name.trim().isEmpty())
-      SETTINGS.setAttribute("region.name." + id, (String) null);
-    else
-      SETTINGS.setAttribute("region.name." + id, name.trim());
-  }
 
   private static synchronized Wallet getWallet() throws Exception
   {

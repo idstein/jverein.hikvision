@@ -11,14 +11,21 @@ import java.security.MessageDigest;
 import java.security.SecureRandom;
 import java.security.cert.X509Certificate;
 import java.time.Duration;
+import java.util.ArrayList;
+import java.util.Collection;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
+import java.net.Socket;
+
 import javax.net.ssl.SSLContext;
+import javax.net.ssl.SSLEngine;
+import javax.net.ssl.SSLParameters;
 import javax.net.ssl.TrustManager;
-import javax.net.ssl.X509TrustManager;
+import javax.net.ssl.X509ExtendedTrustManager;
 
 import org.json.JSONArray;
 import org.json.JSONObject;
@@ -63,7 +70,21 @@ public class HikvisionClient
     this.password = password;
     this.pauseMs = pauseMs;
     HttpClient.Builder b = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(10));
-    if (!verifySsl) b.sslContext(trustAllSslContext());
+    if (!verifySsl)
+    {
+      // Trust-all bypasses cert chain validation, but the JDK still does
+      // hostname/IP verification against the cert's SAN as a separate step
+      // (controlled via SSLParameters.endpointIdentificationAlgorithm —
+      // defaults to "HTTPS" for HttpClient). Hikvision DS-K's self-signed
+      // cert has no SAN entry for whatever local IP/host the controller
+      // got from DHCP, so this fails with "No subject alternative names
+      // matching IP address …" unless we explicitly disable EIA too.
+      SSLContext ctx = trustAllSslContext();
+      b.sslContext(ctx);
+      SSLParameters sp = ctx.getDefaultSSLParameters();
+      sp.setEndpointIdentificationAlgorithm("");   // "" disables hostname check
+      b.sslParameters(sp);
+    }
     this.http = b.build();
   }
 
@@ -245,9 +266,209 @@ public class HikvisionClient
     return out;
   }
 
+  /**
+   * Enumerate the organisational user groups via
+   * {@code UserGroupMgr/SearchUserGroup}. Every user must belong to exactly
+   * one of these ({@code userGroupNodeID}); they are the org tree
+   * (BSV / Vorstand / Mitglieder / Robby Bubble) — including groups that
+   * currently have no members, which the old "derive from existing UserInfo"
+   * approach could never surface.
+   *
+   * <p>NB: belonging to a userGroup is <i>not</i> the same as having door
+   * access — that is governed by the region-permission groups
+   * ({@link #listRegionPermissionGroups}).
+   *
+   * <p>Quirks on DS-K2702WX (firmware V1.7.4): pagination is <b>1-based</b>
+   * (a {@code searchResultPosition} of 0 is rejected) and {@code maxResults}
+   * caps at 33 — we request 30. Each match has {@code nodeID} (= the
+   * {@code userGroupNodeID} on UserInfo records), {@code nodeName},
+   * {@code nodeLevel}, {@code parentNodeID} and {@code userNum}.
+   */
+  public JSONArray listUserGroups() throws IOException
+  {
+    JSONArray out = new JSONArray();
+    int pos = 1;   // this endpoint is 1-based (0 → badJsonContent)
+    while (true)
+    {
+      JSONObject body = new JSONObject()
+          .put("searchID", "jg-" + pos)
+          .put("searchResultPosition", pos)
+          .put("maxResults", 30);
+      JSONObject res = postJson("/ISAPI/AccessControl/UserGroupMgr/SearchUserGroup", body);
+      int total = res.optInt("totalMatches", 0);
+      JSONArray items = res.optJSONArray("matchResults");
+      int got = items != null ? items.length() : 0;
+      if (items != null) for (int i = 0; i < items.length(); i++) out.put(items.getJSONObject(i));
+      Logger.info("Hikvision SearchUserGroup pos=" + pos + " got=" + got + " total=" + total);
+      if (got == 0 || out.length() >= total) break;
+      pos += got;
+      pace();
+    }
+    return out;
+  }
+
+  /**
+   * Enumerate the region-permission groups (Berechtigungsgruppen / door
+   * access) via {@code DoorRegionMgr/SearchRegionPermissionGroup}. THIS is
+   * what actually grants door access: a user is granted access by having a
+   * group's id in their {@code regionPermissionGroupIDList}. Members can
+   * hold several at once.
+   *
+   * <p>Same 1-based pagination quirk as {@link #listUserGroups}. Each match
+   * carries {@code regionPermissionGroupID} (int), {@code regionPermissionGroupName},
+   * a {@code doorIDList} (door id + region node name), {@code userNum} and
+   * {@code userGroupNum}.
+   */
+  public JSONArray listRegionPermissionGroups() throws IOException
+  {
+    JSONArray out = new JSONArray();
+    int pos = 1;   // 1-based, same as SearchUserGroup
+    while (true)
+    {
+      JSONObject body = new JSONObject()
+          .put("searchID", "rp-" + pos)
+          .put("searchResultPosition", pos)
+          .put("maxResults", 30);
+      JSONObject res = postJson("/ISAPI/AccessControl/DoorRegionMgr/SearchRegionPermissionGroup", body);
+      int total = res.optInt("totalMatches", 0);
+      JSONArray items = res.optJSONArray("matchResults");
+      int got = items != null ? items.length() : 0;
+      if (items != null) for (int i = 0; i < items.length(); i++) out.put(items.getJSONObject(i));
+      Logger.info("Hikvision SearchRegionPermissionGroup pos=" + pos + " got=" + got + " total=" + total);
+      if (got == 0 || out.length() >= total) break;
+      pos += got;
+      pace();
+    }
+    return out;
+  }
+
+  /** Max employeeNos per scoped Search request. DS-K2702WX honors larger
+   *  batches, but we cap to keep one POST predictable and to stay well
+   *  under any controller-side request-size limits. */
+  private static final int SCOPED_BATCH = 100;
+
+  /** Scoped variant of {@link #listAllUsers}: fetches only the named
+   *  employeeNos via the {@code EmployeeNoList} filter on
+   *  UserInfoSearchCond. Missing employeeNos are silently dropped by the
+   *  controller (verified on DS-K2702WX). Batched in groups of
+   *  {@value #SCOPED_BATCH}. */
+  public JSONArray listUsers(Collection<String> employeeNos, ProgressListener pl) throws IOException
+  {
+    JSONArray out = new JSONArray();
+    if (employeeNos == null || employeeNos.isEmpty()) return out;
+    List<List<String>> batches = chunk(new ArrayList<>(employeeNos), SCOPED_BATCH);
+    int done = 0, total = employeeNos.size();
+    for (List<String> batch : batches)
+    {
+      JSONArray empList = new JSONArray();
+      for (String e : batch) empList.put(new JSONObject().put("employeeNo", e));
+      JSONObject body = new JSONObject().put("UserInfoSearchCond",
+          new JSONObject().put("searchID", "j-scoped-" + done)
+                          .put("searchResultPosition", 0)
+                          .put("maxResults", batch.size())
+                          .put("EmployeeNoList", empList));
+      JSONObject res = postJson("/ISAPI/AccessControl/UserInfo/Search", body);
+      JSONObject inner = res.getJSONObject("UserInfoSearch");
+      JSONArray items = inner.optJSONArray("UserInfo");
+      int got = items != null ? items.length() : 0;
+      if (items != null) for (int i = 0; i < items.length(); i++) out.put(items.getJSONObject(i));
+      Logger.info("Hikvision UserInfo/Search scoped batch=" + batch.size() + " got=" + got);
+      done += batch.size();
+      if (pl != null) pl.progress(done, total, "Benutzer abrufen (gezielt)");
+      if (pl != null && pl.isCancelled())
+        throw new InterruptedIOException("Abgebrochen nach " + done + "/" + total + " Benutzern");
+      if (batches.size() > 1) pace();
+    }
+    return out;
+  }
+
+  /** Scoped variant of {@link #listAllCards}: fetches only cards belonging
+   *  to the named employeeNos via the {@code EmployeeNoList} filter on
+   *  CardInfoSearchCond. Batched in groups of {@value #SCOPED_BATCH}. */
+  public JSONArray listCards(Collection<String> employeeNos, ProgressListener pl) throws IOException
+  {
+    JSONArray out = new JSONArray();
+    if (employeeNos == null || employeeNos.isEmpty()) return out;
+    List<List<String>> batches = chunk(new ArrayList<>(employeeNos), SCOPED_BATCH);
+    int done = 0, total = employeeNos.size();
+    for (List<String> batch : batches)
+    {
+      JSONArray empList = new JSONArray();
+      for (String e : batch) empList.put(new JSONObject().put("employeeNo", e));
+      // One employeeNo can own multiple cards; pad maxResults so a card-rich
+      // batch (≤5 cards/person seen in practice) still completes in one POST.
+      JSONObject body = new JSONObject().put("CardInfoSearchCond",
+          new JSONObject().put("searchID", "j-scoped-" + done)
+                          .put("searchResultPosition", 0)
+                          .put("maxResults", Math.max(batch.size() * 5, 200))
+                          .put("EmployeeNoList", empList));
+      JSONObject res = postJson("/ISAPI/AccessControl/CardInfo/Search", body);
+      JSONObject inner = res.getJSONObject("CardInfoSearch");
+      JSONArray items = inner.optJSONArray("CardInfo");
+      int got = items != null ? items.length() : 0;
+      if (items != null) for (int i = 0; i < items.length(); i++) out.put(items.getJSONObject(i));
+      Logger.info("Hikvision CardInfo/Search scoped batch=" + batch.size() + " got=" + got);
+      done += batch.size();
+      if (pl != null) pl.progress(done, total, "Karten abrufen (gezielt)");
+      if (pl != null && pl.isCancelled())
+        throw new InterruptedIOException("Abgebrochen nach " + done + "/" + total + " Karten-Lookup");
+      if (batches.size() > 1) pace();
+    }
+    return out;
+  }
+
+  /** Cheap O(1) probe: returns the controller's totalMatches for UserInfo
+   *  without pulling any records. Used to detect drift before deciding
+   *  between incremental and full refresh. */
+  public int getTotalUsers() throws IOException
+  {
+    JSONObject body = new JSONObject().put("UserInfoSearchCond",
+        new JSONObject().put("searchID", "j-count")
+                        .put("searchResultPosition", 0)
+                        .put("maxResults", 1));
+    JSONObject res = postJson("/ISAPI/AccessControl/UserInfo/Search", body);
+    return res.getJSONObject("UserInfoSearch").optInt("totalMatches", -1);
+  }
+
+  /** Cheap O(1) probe: see {@link #getTotalUsers}. */
+  public int getTotalCards() throws IOException
+  {
+    JSONObject body = new JSONObject().put("CardInfoSearchCond",
+        new JSONObject().put("searchID", "j-count")
+                        .put("searchResultPosition", 0)
+                        .put("maxResults", 1));
+    JSONObject res = postJson("/ISAPI/AccessControl/CardInfo/Search", body);
+    return res.getJSONObject("CardInfoSearch").optInt("totalMatches", -1);
+  }
+
+  private static <T> List<List<T>> chunk(List<T> src, int size)
+  {
+    List<List<T>> out = new ArrayList<>();
+    for (int i = 0; i < src.size(); i += size)
+      out.add(src.subList(i, Math.min(i + size, src.size())));
+    return out;
+  }
+
+  /**
+   * Create a new user record. Defaults to enabled (the previous version
+   * had {@code enable:false} hard-coded, which left every newly synced
+   * member disabled on the controller until manually fixed).
+   *
+   * {@code beginTime} / {@code endTime} drive the controller's
+   * auto-expiry — pass jverein's eintritt / austritt to let Hikvision
+   * disable the user automatically on the configured date even without
+   * a sync. Pass null/empty to use the wide-open defaults
+   * (2000-01-01 / 2037-12-31).
+   *
+   * {@code userGroupNodeID}/{@code userGroupNodeName} place the user in the
+   * organisational group (required). {@code regionPermissionGroupIds} grants
+   * door access — pass the ids of the region-permission groups the user
+   * should belong to (may be empty/null for none).
+   */
   public boolean createUser(String employeeNo, String name, String userType,
-                            String groupId, String groupName, int regionPermissionGroup,
-                            String gender) throws IOException
+                            String groupId, String groupName,
+                            boolean enable, String beginTime, String endTime,
+                            String gender, java.util.List<Integer> regionPermissionGroupIds) throws IOException
   {
     JSONObject u = new JSONObject();
     u.put("employeeNo", employeeNo);
@@ -255,16 +476,17 @@ public class HikvisionClient
     u.put("userType", userType);
     u.put("closeDelayEnabled", false);
     u.put("Valid", new JSONObject()
-        .put("enable", false)
-        .put("beginTime", "2000-01-01T00:00:00")
-        .put("endTime", "2037-12-31T23:59:59")
+        .put("enable", enable)
+        .put("beginTime", beginTime == null || beginTime.isEmpty() ? "2000-01-01T00:00:00" : beginTime)
+        .put("endTime",   endTime   == null || endTime.isEmpty()   ? "2037-12-31T23:59:59" : endTime)
         .put("timeType", "local"));
     u.put("belongGroup", "");
     u.put("password", "");
     u.put("localPassword", "");
     u.put("userGroupNodeID", groupId);
     u.put("userGroupNodeName", groupName);
-    u.put("regionPermissionGroupIDList", new JSONArray().put(regionPermissionGroup));
+    if (regionPermissionGroupIds != null && !regionPermissionGroupIds.isEmpty())
+      u.put("regionPermissionGroupIDList", new JSONArray(regionPermissionGroupIds));
     u.put("doorRight", "");
     u.put("maxOpenDoorTime", 0);
     u.put("openDoorTime", 0);
@@ -273,6 +495,50 @@ public class HikvisionClient
         new JSONObject().put("UserInfo", u));
     pace();
     return isOk(res);
+  }
+
+  /** Replace the user's region-permission-group membership (door access).
+   *  Sends the full desired id list — the controller treats this as the
+   *  new complete set, so it both adds and removes. An empty list clears
+   *  all individually-assigned region permissions. */
+  public boolean setUserRegionPermissionGroups(String employeeNo, java.util.List<Integer> regionPermissionGroupIds) throws IOException
+  {
+    JSONArray ids = new JSONArray(regionPermissionGroupIds == null
+        ? java.util.Collections.emptyList() : regionPermissionGroupIds);
+    return modifyUser(employeeNo, new JSONObject().put("regionPermissionGroupIDList", ids));
+  }
+
+  /**
+   * Partial-modify a user. Hikvision's Modify endpoint accepts a UserInfo
+   * with only the fields you want to change (plus employeeNo). Untouched
+   * fields (including userType — important for blackList) are preserved.
+   */
+  public boolean modifyUser(String employeeNo, JSONObject changes) throws IOException
+  {
+    JSONObject u = new JSONObject(changes.toString());   // shallow copy
+    u.put("employeeNo", employeeNo);
+    JSONObject res = putJson("/ISAPI/AccessControl/UserInfo/Modify",
+        new JSONObject().put("UserInfo", u));
+    pace();
+    return isOk(res);
+  }
+
+  /** Flip Valid.enable and optionally rewrite Valid.endTime in one PUT. */
+  public boolean setUserValid(String employeeNo, boolean enable, String endTime) throws IOException
+  {
+    JSONObject valid = new JSONObject()
+        .put("enable", enable)
+        .put("beginTime", "2000-01-01T00:00:00")
+        .put("endTime", endTime == null || endTime.isEmpty() ? "2037-12-31T23:59:59" : endTime)
+        .put("timeType", "local");
+    return modifyUser(employeeNo, new JSONObject().put("Valid", valid));
+  }
+
+  /** Re-assign the user to a different Hikvision user group. */
+  public boolean setUserGroup(String employeeNo, String groupId, String groupName) throws IOException
+  {
+    return modifyUser(employeeNo,
+        new JSONObject().put("userGroupNodeID", groupId).put("userGroupNodeName", groupName));
   }
 
   public boolean deleteUser(String employeeNo) throws IOException
@@ -318,51 +584,36 @@ public class HikvisionClient
     return request("GET", "/ISAPI/System/deviceInfo", null);
   }
 
-  /**
-   * UserRightPlanTemplate — the controller's time-based permission templates.
-   * Returns a map of planTemplateID → templateName for any template that has
-   * a non-empty name. Pagination is 1-based (not 0-based) with a per-page
-   * cap of 20, which surprised me when I first tried.
-   */
-  public java.util.Map<Integer, String> listRightPlanTemplateNames() throws IOException
-  {
-    java.util.Map<Integer, String> names = new java.util.HashMap<>();
-    int pos = 1;
-    while (true)
-    {
-      JSONObject body = new JSONObject()
-          .put("searchID", "rt-" + pos)
-          .put("searchResultPosition", pos)
-          .put("maxResults", 20);
-      JSONObject res = new JSONObject(request("POST",
-          "/ISAPI/AccessControl/UserRightPlanTemplate/Search?format=json", body.toString()));
-      int total = res.optInt("totalMatches", 0);
-      JSONArray items = res.optJSONArray("matchResults");
-      if (items == null || items.length() == 0) break;
-      for (int i = 0; i < items.length(); i++)
-      {
-        JSONObject t = items.getJSONObject(i);
-        int id = t.optInt("planTemplateID", -1);
-        String name = t.optString("templateName", "").trim();
-        if (id >= 0 && !name.isEmpty()) names.put(id, name);
-      }
-      pos += items.length();
-      if (pos > total) break;
-      pace();
-    }
-    return names;
-  }
-
   // ---------------------------------------------- TLS: trust self-signed
 
+  /**
+   * Trust-all SSLContext for self-signed Hikvision DS-K controllers.
+   *
+   * Uses {@link X509ExtendedTrustManager} — NOT the basic
+   * {@link javax.net.ssl.X509TrustManager} — on purpose. The JDK's
+   * {@code SSLContextImpl.AbstractTrustManagerWrapper} auto-wraps any
+   * plain {@code X509TrustManager} to run {@code checkAdditionalTrust},
+   * which performs SAN / hostname-IP validation even after our
+   * trust-all method returns. The extended variant is treated as
+   * "handles identity itself", so no wrapping happens — and our
+   * permissive no-op behaviour wins.
+   *
+   * Combined with {@code SSLParameters.endpointIdentificationAlgorithm("")}
+   * we get a full bypass: no cert chain check, no IP/SAN check. Only safe
+   * because the controller is on the LAN behind digest auth.
+   */
   private static SSLContext trustAllSslContext()
   {
     try
     {
-      TrustManager[] tm = new TrustManager[] { new X509TrustManager() {
+      TrustManager[] tm = new TrustManager[] { new X509ExtendedTrustManager() {
         public X509Certificate[] getAcceptedIssuers() { return new X509Certificate[0]; }
         public void checkClientTrusted(X509Certificate[] c, String a) {}
         public void checkServerTrusted(X509Certificate[] c, String a) {}
+        public void checkClientTrusted(X509Certificate[] c, String a, Socket s) {}
+        public void checkServerTrusted(X509Certificate[] c, String a, Socket s) {}
+        public void checkClientTrusted(X509Certificate[] c, String a, SSLEngine e) {}
+        public void checkServerTrusted(X509Certificate[] c, String a, SSLEngine e) {}
       }};
       SSLContext ctx = SSLContext.getInstance("TLS");
       ctx.init(null, tm, new SecureRandom());

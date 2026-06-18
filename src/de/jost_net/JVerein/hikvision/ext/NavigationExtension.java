@@ -52,7 +52,7 @@ public class NavigationExtension implements Extension
       hik.addChild(new MyItem(hik, "Benutzer",              new HikvisionBenutzerAction(), "user-friends.png"));
       hik.addChild(new MyItem(hik, "Transponder",           new HikvisionChipsAction(),    "stock_keyring.png"));
       hik.addChild(new MyItem(hik, "Organisationsgruppen",  new HikvisionGruppenAction(),  "users.png"));
-      hik.addChild(new MyItem(hik, "Türrechte",             new HikvisionRechteAction(),   "locked.png"));
+      hik.addChild(new MyItem(hik, "Berechtigungsgruppen",  new HikvisionRechteAction(),   "locked.png"));
     }
     catch (Exception e)
     {
