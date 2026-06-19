@@ -51,10 +51,16 @@ public class MitgliedAssignments
     public String externe = "";
     public String employeeNo = "";
     public final List<String> transponder = new ArrayList<>();
-    /** Org userGroup. Informational only — the userGroup is applied
-     *  automatically on sync (members → Mitglieder, sponsors → BSV) and is
-     *  not chosen per member. Kept for visibility / migration record. */
+    /** Org userGroup chosen for this member. Only authoritative when
+     *  {@link #groupManaged} is true (explicitly set via the dialog);
+     *  otherwise the sync engine derives the desired group automatically
+     *  (sponsors → BSV, members in the guest group → Mitglieder, members
+     *  already in a member group → unchanged). */
     public String hikvisionGroup = "";
+    /** True once the user explicitly picked an Org-Gruppe in the dialog.
+     *  Legacy/migrated entries are false → governed by the auto rule, so a
+     *  stale stored group never produces a spurious "move" on sync. */
+    public boolean groupManaged = false;
     /** Door-access Berechtigungsgruppen (region-permission group NAMES) this
      *  member should hold. Resolved to controller ids at sync time and
      *  written to the user's regionPermissionGroupIDList. Default empty (no
@@ -116,6 +122,7 @@ public class MitgliedAssignments
       a.externe = o.optString("externe", "");
       a.employeeNo = o.optString("employeeNo", "");
       a.hikvisionGroup = o.optString("hikvisionGroup", "");
+      a.groupManaged = o.optBoolean("groupManaged", false);
       a.modifiedAt = o.optLong("modifiedAt", 0L);
       JSONArray tr = o.optJSONArray("transponder");
       if (tr != null) for (int j = 0; j < tr.length(); j++)
@@ -144,6 +151,7 @@ public class MitgliedAssignments
       o.put("externe", a.externe == null ? "" : a.externe);
       o.put("employeeNo", a.employeeNo == null ? "" : a.employeeNo);
       o.put("hikvisionGroup", a.hikvisionGroup == null ? "" : a.hikvisionGroup);
+      if (a.groupManaged) o.put("groupManaged", true);
       o.put("transponder", new JSONArray(a.transponder));
       o.put("regionPermissionGroups", new JSONArray(a.regionPermissionGroups));
       if (a.modifiedAt > 0L) o.put("modifiedAt", a.modifiedAt);

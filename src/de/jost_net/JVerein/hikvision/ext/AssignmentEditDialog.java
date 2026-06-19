@@ -94,6 +94,7 @@ public final class AssignmentEditDialog
     int gidx = java.util.Arrays.asList(groupNames).indexOf(preGroup);
     if (gidx >= 0) groupCombo.select(gidx);
     else if (groupNames.length > 0) groupCombo.select(0);
+    final String initialGroup = groupCombo.getText().trim();   // to detect an explicit change on save
 
     // --- Berechtigungsgruppen (Türzugang) multi-select ---
     java.util.Set<String> currentRegions = existing == null
@@ -283,7 +284,12 @@ public final class AssignmentEditDialog
           my.regionPermissionGroups.clear();
           my.regionPermissionGroups.addAll(selectedRegions);
           String chosenGroup = groupCombo.getText().trim();
-          my.hikvisionGroup = chosenGroup.isEmpty() ? defaultGroup : chosenGroup;
+          if (chosenGroup.isEmpty()) chosenGroup = defaultGroup;
+          my.hikvisionGroup = chosenGroup;
+          // Only mark as explicitly managed when the user actually changed the
+          // group — otherwise leave it to the automatic rule (so e.g. opening a
+          // member who is wrongly in BSV and saving doesn't "bless" BSV).
+          if (!chosenGroup.equals(initialGroup)) my.groupManaged = true;
           store.touch(my.jvId);
           store.save();
 

@@ -153,8 +153,8 @@ public class HikvisionBenutzerView extends AbstractView
     table.setLayoutData(tgd);
     String[][] cols = {
         { "Status", "90" }, { "employeeNo", "100" }, { "Name", "170" },
-        { "Typ", "70" }, { "Org.-Gruppe", "100" }, { "Berechtigungsgruppen", "170" },
-        { "Transponder ist", "150" }, { "Transponder soll", "150" }, { "Hinweis", "240" } };
+        { "Typ", "70" }, { "Org.-Gruppe", "130" }, { "Berechtigungsgruppen", "180" },
+        { "Transponder", "180" }, { "Hinweis", "240" } };
     for (String[] col : cols)
     {
       TableColumn tc = new TableColumn(table, SWT.LEFT);
@@ -355,17 +355,17 @@ public class HikvisionBenutzerView extends AbstractView
       String emp = r.employeeNo == null ? "" : r.employeeNo;
       String nm  = r.name == null ? "" : r.name;
       String ty  = r.userType == null ? "" : r.userType;
-      // Org userGroup: current controller value, or the desired/default
-      // (Mitglieder/BSV) for rows not yet on the controller (CREATE).
-      String gp  = (r.groupName != null && !r.groupName.isEmpty()) ? r.groupName
-                 : (r.desiredGroupName == null ? "" : r.desiredGroupName);
-      String ber = renderRegions(r);
-      String cur = renderTransponders(r.currentCards);
-      String des = renderTransponders(r.desiredCards);
+      // Managed = a jverein-driven row (not HIK-only / orphan / incomplete);
+      // only those show an "ist → soll" arrow.
+      boolean managed = r.status != null && r.status != SyncEngine.Status.HIK_ONLY
+          && r.status != SyncEngine.Status.DELETE && r.status != SyncEngine.Status.INCOMPLETE;
+      String gp     = renderGroupInline(r, managed);
+      String ber    = renderRegionsInline(r, managed);
+      String transp = renderTransponderInline(r, managed);
       String det = composeDetail(r);
       if (!q.isEmpty())
       {
-        String haystack = (emp + " " + nm + " " + ty + " " + gp + " " + ber + " " + cur + " " + des + " " + det).toLowerCase();
+        String haystack = (emp + " " + nm + " " + ty + " " + gp + " " + ber + " " + transp + " " + det).toLowerCase();
         if (!haystack.contains(q)) continue;
       }
       TableItem ti = new TableItem(table, SWT.NONE);
@@ -375,9 +375,8 @@ public class HikvisionBenutzerView extends AbstractView
       ti.setText(3, ty);
       ti.setText(4, gp);
       ti.setText(5, ber);
-      ti.setText(6, cur);
-      ti.setText(7, des);
-      ti.setText(8, det);
+      ti.setText(6, transp);
+      ti.setText(7, det);
     }
     // Preserve the user's column sort across filter / refresh — without this
     // the table header keeps the ↑/↓ indicator but the rows are unsorted.
@@ -416,23 +415,54 @@ public class HikvisionBenutzerView extends AbstractView
   /** Display cards as their Transponder ids. Cards without a ChipStore
    *  mapping show as "Karte #<cardNo>" so the user can still see what's on
    *  the Hikvision side, with the raw number flagged as unmapped. */
-  /** Render the row's Berechtigungsgruppen. Prefers the desired (assigned)
-   *  names; for rows with no store assignment, falls back to what's
-   *  currently on the controller (resolved via the cached id→name map),
-   *  flagged with "(ist)". */
-  private String renderRegions(SyncEngine.PlanRow r)
+  /** "ist → soll" when they differ, else just the value. ∅ marks an empty side. */
+  private static String arrow(String ist, String soll)
   {
-    if (r.desiredRegionNames != null && !r.desiredRegionNames.isEmpty())
-      return String.join(",", r.desiredRegionNames);
-    if (r.currentRegionIds == null || r.currentRegionIds.isEmpty()) return "";
+    return (ist.isEmpty() ? "∅" : ist) + " → " + (soll.isEmpty() ? "∅" : soll);
+  }
+
+  /** Org-Gruppe column: ist → soll when the desired group differs (managed rows). */
+  private String renderGroupInline(SyncEngine.PlanRow r, boolean managed)
+  {
+    String ist = r.groupName == null ? "" : r.groupName;
+    String soll = r.desiredGroupName == null ? "" : r.desiredGroupName;
+    if (managed && !soll.isEmpty() && !soll.equals(ist)) return arrow(ist, soll);
+    return ist.isEmpty() ? soll : ist;
+  }
+
+  /** Berechtigungsgruppen column. Unmanaged (no assigned groups) → just shows
+   *  what's currently on the controller; managed → ist → soll when differing. */
+  private String renderRegionsInline(SyncEngine.PlanRow r, boolean managed)
+  {
+    String ist = renderRegionIds(r.currentRegionIds);
+    boolean rManaged = managed && r.desiredRegionIds != null && !r.desiredRegionIds.isEmpty();
+    if (!rManaged) return ist;
+    String soll = (r.desiredRegionNames != null && !r.desiredRegionNames.isEmpty())
+        ? String.join(",", r.desiredRegionNames) : renderRegionIds(r.desiredRegionIds);
+    boolean differ = !new java.util.HashSet<>(r.desiredRegionIds).equals(new java.util.HashSet<>(r.currentRegionIds));
+    return differ ? arrow(ist, soll) : soll;
+  }
+
+  /** Transponder column: ist → soll when the card sets differ (managed rows). */
+  private String renderTransponderInline(SyncEngine.PlanRow r, boolean managed)
+  {
+    String ist = renderTransponders(r.currentCards);
+    if (!managed) return ist;
+    boolean differ = !new java.util.HashSet<>(r.currentCards).equals(new java.util.HashSet<>(r.desiredCards));
+    return differ ? arrow(ist, renderTransponders(r.desiredCards)) : ist;
+  }
+
+  private String renderRegionIds(java.util.List<Integer> ids)
+  {
+    if (ids == null || ids.isEmpty()) return "";
     StringBuilder sb = new StringBuilder();
-    for (Integer id : r.currentRegionIds)
+    for (Integer id : ids)
     {
       if (sb.length() > 0) sb.append(",");
       String nm = regionNameById.get(id);
       sb.append(nm != null ? nm : ("#" + id));
     }
-    return sb.append(" (ist)").toString();
+    return sb.toString();
   }
 
   private String renderTransponders(java.util.List<String> cards)

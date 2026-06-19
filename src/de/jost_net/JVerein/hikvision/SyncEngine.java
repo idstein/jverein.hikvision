@@ -99,6 +99,10 @@ public class SyncEngine
     public String groupId;
     public String desiredGroupName;
     public String desiredGroupId;
+    // inputs for the automatic org-group rule (resolved once current is known)
+    public boolean isSponsor;
+    public boolean groupManaged;       // user explicitly chose the Org-Gruppe
+    public String storedGroupName = "";// the assignment's chosen group (only used when groupManaged)
     public List<String> currentCards = new ArrayList<>();
     public List<String> desiredCards = new ArrayList<>();
     /** Door-access region-permission groups. current = what's on the
@@ -197,6 +201,27 @@ public class SyncEngine
     }
   }
 
+  /** Desired org userGroup name for a row.
+   *  <ul>
+   *    <li>explicitly managed → the user's chosen group;</li>
+   *    <li>sponsor → the configured guest group (BSV);</li>
+   *    <li>member currently in the guest group → the member default (Mitglieder);</li>
+   *    <li>member already in a member group (Mitglieder/Vorstand/…) → unchanged;</li>
+   *    <li>new member with no controller record → member default.</li>
+   *  </ul>
+   *  This flags only guest/member boundary violations, never legitimate
+   *  Vorstand/Robby-Bubble membership. */
+  private static String autoGroupName(boolean managed, String storedGroup, boolean sponsor, String currentGroup)
+  {
+    if (managed && storedGroup != null && !storedGroup.isEmpty()) return storedGroup;
+    String guestGroup  = HikvisionSettings.getSponsorGroupName();
+    String memberGroup = HikvisionSettings.getMemberGroupName();
+    if (sponsor) return guestGroup;
+    if (currentGroup == null || currentGroup.isEmpty()) return memberGroup;   // new/unknown
+    if (currentGroup.equals(guestGroup)) return memberGroup;                  // member in guest group → move
+    return currentGroup;                                                      // already a member group → keep
+  }
+
   /** org userGroup name → UUID lookup, for resolving a Mitglied's assigned
    *  Organisationsgruppe to the controller's userGroupNodeID. */
   private static Map<String, String> uuidByGroupName(HikvisionGroupCatalog cat)
@@ -293,12 +318,11 @@ public class SyncEngine
       row.employeeNo = id.employeeNo;
       row.name = (safe(m.getVorname()) + " " + safe(m.getName())).trim();
       row.userType = id.isSponsor ? "visitor" : "normal";    // default; preserved from Hikvision side if record exists
-      // org userGroup: per-member choice from the assignment; falls back to
-      // the default (members → Mitglieder, sponsors → BSV) if unset.
-      String gname = (a.hikvisionGroup != null && !a.hikvisionGroup.isEmpty()) ? a.hikvisionGroup
-          : (id.isSponsor ? HikvisionSettings.getSponsorGroupName() : HikvisionSettings.getMemberGroupName());
-      row.desiredGroupName = gname;
-      row.desiredGroupId = uuidByGroupName.get(gname);   // may be null → resolved/failed in applyCreate
+      // org userGroup: decided once the controller's current group is known
+      // (overlay / CREATE branch below). Capture the inputs here.
+      row.isSponsor = id.isSponsor;
+      row.groupManaged = a.groupManaged;
+      row.storedGroupName = a.hikvisionGroup == null ? "" : a.hikvisionGroup;
       // door access = Berechtigungsgruppen mapped per member (default none)
       row.desiredRegionNames = new ArrayList<>(a.regionPermissionGroups);
       row.desiredRegionIds = resolveRegionIds(row.desiredRegionNames, regionIdByName,
@@ -407,6 +431,8 @@ public class SyncEngine
       d.groupId = u.optString("userGroupNodeID", "");
       d.groupName = u.optString("userGroupNodeName", "");
       d.currentRegionIds = regionIdsOf(u);
+      d.desiredGroupName = autoGroupName(d.groupManaged, d.storedGroupName, d.isSponsor, d.groupName);
+      d.desiredGroupId = uuidByGroupName.get(d.desiredGroupName);
       d.userType = u.optString("userType", d.userType);  // preserve actual (blackList etc.)
       JSONObject vl = u.optJSONObject("Valid");
       if (vl != null)
@@ -432,6 +458,8 @@ public class SyncEngine
     {
       if (row.desiredCards.isEmpty())
       { plan.membersSkipped++; continue; }    // no transponder → no Hikvision record
+      row.desiredGroupName = autoGroupName(row.groupManaged, row.storedGroupName, row.isSponsor, "");
+      row.desiredGroupId = uuidByGroupName.get(row.desiredGroupName);
       row.status = Status.CREATE;
       row.detail = "neu auf Hikvision anlegen — Gruppe " + row.desiredGroupName
           + ", " + row.desiredCards.size() + " Karte(n)"
@@ -526,10 +554,9 @@ public class SyncEngine
       row.employeeNo = id.employeeNo;
       row.name = (safe(m.getVorname()) + " " + safe(m.getName())).trim();
       row.userType = id.isSponsor ? "visitor" : "normal";
-      String gname = (a.hikvisionGroup != null && !a.hikvisionGroup.isEmpty()) ? a.hikvisionGroup
-          : (id.isSponsor ? HikvisionSettings.getSponsorGroupName() : HikvisionSettings.getMemberGroupName());
-      row.desiredGroupName = gname;
-      row.desiredGroupId = uuidByGroupName.get(gname);
+      row.isSponsor = id.isSponsor;
+      row.groupManaged = a.groupManaged;
+      row.storedGroupName = a.hikvisionGroup == null ? "" : a.hikvisionGroup;
       row.desiredRegionNames = new ArrayList<>(a.regionPermissionGroups);
       row.desiredRegionIds = resolveRegionIds(row.desiredRegionNames, regionIdByName,
           row.name + " (jv_id=" + m.getID() + ")", pl);
@@ -608,6 +635,8 @@ public class SyncEngine
         d.groupId = u.optString("userGroupNodeID", "");
         d.groupName = u.optString("userGroupNodeName", "");
         d.currentRegionIds = regionIdsOf(u);
+        d.desiredGroupName = autoGroupName(d.groupManaged, d.storedGroupName, d.isSponsor, d.groupName);
+        d.desiredGroupId = uuidByGroupName.get(d.desiredGroupName);
         d.userType = u.optString("userType", d.userType);
         JSONObject vl = u.optJSONObject("Valid");
         if (vl != null)
@@ -622,6 +651,8 @@ public class SyncEngine
         PlanRow d = desired.remove(emp);
         if (d == null) continue;                  // emp dropped from both sides — no row
         if (d.desiredCards.isEmpty()) continue;   // assignment exists but no cards — skip
+        d.desiredGroupName = autoGroupName(d.groupManaged, d.storedGroupName, d.isSponsor, "");
+        d.desiredGroupId = uuidByGroupName.get(d.desiredGroupName);
         d.status = Status.CREATE;
         d.detail = "neu auf Hikvision anlegen — Gruppe " + d.desiredGroupName
             + ", " + d.desiredCards.size() + " Karte(n)"
@@ -705,9 +736,14 @@ public class SyncEngine
     Set<String> rem = new HashSet<>(d.currentCards); rem.removeAll(d.desiredCards);
     boolean cardsDiffer = !add.isEmpty() || !rem.isEmpty();
 
+    // Empty desired Berechtigungsgruppen = "not managed here": leave whatever
+    // the controller has alone (don't flag, don't sync). A member only
+    // becomes region-managed once at least one group is assigned in the UI.
+    boolean regionsManaged = !d.desiredRegionIds.isEmpty();
     Set<Integer> addR = new HashSet<>(d.desiredRegionIds); addR.removeAll(d.currentRegionIds);
     Set<Integer> remR = new HashSet<>(d.currentRegionIds); remR.removeAll(d.desiredRegionIds);
-    boolean regionsDiffer = !addR.isEmpty() || !remR.isEmpty();
+    boolean regionsDiffer = regionsManaged && (!addR.isEmpty() || !remR.isEmpty());
+    if (!regionsManaged) { addR.clear(); remR.clear(); }   // don't render region detail when unmanaged
 
     boolean groupDiffers = d.desiredGroupId != null && !d.desiredGroupId.isEmpty()
         && !d.desiredGroupId.equals(d.groupId);
