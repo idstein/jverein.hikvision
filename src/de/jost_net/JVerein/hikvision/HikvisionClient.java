@@ -90,23 +90,70 @@ public class HikvisionClient
 
   // ---------------------------------------------------------------- HTTP
 
-  /** One round-trip with fresh digest. Throws on non-2xx final response. */
+  /** Max attempts per request. The controller intermittently rejects a valid
+   *  digest with a 401 {@code <userCheck>} (single-use nonce / session-pool
+   *  contention under sustained load) or drops the connection. A single such
+   *  hiccup must NOT abort a ~60-call full refresh, so we re-do the full
+   *  challenge-response with a fresh nonce a few times before giving up. */
+  private static final int MAX_ATTEMPTS = 4;
+
+  /** One logical round-trip with fresh digest, retried on transient 401 /
+   *  connection failures. Throws on a genuine non-2xx (other than a retried
+   *  401) or after all attempts are exhausted. */
   public String request(String method, String path, String body) throws IOException
   {
     String url = baseUrl + path;
-    HttpResponse<String> r1 = send(method, url, body, null);
-    if (r1.statusCode() != 401) return r1.body();
+    IOException last = null;
+    for (int attempt = 1; attempt <= MAX_ATTEMPTS; attempt++)
+    {
+      HttpResponse<String> r1;
+      try { r1 = send(method, url, body, null); }
+      catch (InterruptedIOException ie) { throw ie; }   // cancellation — never retry
+      catch (IOException e) { last = e; if (!backoff(attempt, method, path, e)) throw e; continue; }
 
-    String challenge = r1.headers().firstValue("WWW-Authenticate").orElse(null);
-    if (challenge == null)
-      throw new IOException("no WWW-Authenticate header from " + url);
+      if (r1.statusCode() != 401)
+      {
+        if (r1.statusCode() >= 200 && r1.statusCode() < 300) return r1.body();
+        // non-401 error without an auth challenge → fatal (not retryable)
+        throw new IOException("HTTP " + r1.statusCode() + " on " + method + " " + path + ": " + r1.body());
+      }
 
-    String auth = buildDigestHeader(challenge, method, path);
-    HttpResponse<String> r2 = send(method, url, body, auth);
-    int code = r2.statusCode();
-    if (code < 200 || code >= 300)
+      String challenge = r1.headers().firstValue("WWW-Authenticate").orElse(null);
+      if (challenge == null) throw new IOException("no WWW-Authenticate header from " + url);
+
+      String auth = buildDigestHeader(challenge, method, path);
+      HttpResponse<String> r2;
+      try { r2 = send(method, url, body, auth); }
+      catch (InterruptedIOException ie) { throw ie; }
+      catch (IOException e) { last = e; if (!backoff(attempt, method, path, e)) throw e; continue; }
+
+      int code = r2.statusCode();
+      if (code >= 200 && code < 300) return r2.body();
+      if (code == 401)
+      {
+        // Auth rejected though credentials are valid → transient; the request
+        // was NOT processed, so retrying with a fresh nonce is safe.
+        last = new IOException("HTTP 401 on " + method + " " + path + ": " + r2.body());
+        if (!backoff(attempt, method, path, last)) throw last;
+        continue;
+      }
       throw new IOException("HTTP " + code + " on " + method + " " + path + ": " + r2.body());
-    return r2.body();
+    }
+    throw last != null ? last
+        : new IOException("Hikvision-Request fehlgeschlagen nach " + MAX_ATTEMPTS + " Versuchen: " + method + " " + path);
+  }
+
+  /** Log + pause before the next attempt. Returns false when no attempts are
+   *  left (caller should then throw). Pauses one inter-call interval to let
+   *  the controller's session pool recover. */
+  private boolean backoff(int attempt, String method, String path, IOException cause) throws InterruptedIOException
+  {
+    if (attempt >= MAX_ATTEMPTS) return false;
+    Logger.warn("Hikvision-Wiederholung " + (attempt + 1) + "/" + MAX_ATTEMPTS + " für " + method + " " + path
+        + " nach: " + cause.getClass().getSimpleName() + ": " + cause.getMessage());
+    try { Thread.sleep(Math.max(pauseMs, 1500)); }
+    catch (InterruptedException e) { Thread.currentThread().interrupt(); throw new InterruptedIOException(e.getMessage()); }
+    return true;
   }
 
   private HttpResponse<String> send(String method, String url, String body, String authHeader) throws IOException
