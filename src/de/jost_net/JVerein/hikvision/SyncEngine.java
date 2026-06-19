@@ -717,6 +717,74 @@ public class SyncEngine
     }
   }
 
+  /** Recompute the summary counters from the current row statuses. */
+  public static void recount(Plan p)
+  {
+    p.ok = p.create = p.update = p.disable = p.reactivate = p.delete = p.incomplete = p.hikOnly = 0;
+    for (PlanRow r : p.rows) tally(p, r.status);
+  }
+
+  /**
+   * Offline update of one Mitglied's cached plan row after an in-UI
+   * assignment edit — recomputes the desired side (Org-Gruppe,
+   * Berechtigungsgruppen, transponder, validity) and re-diffs it against the
+   * row's already-known controller state, WITHOUT contacting the controller.
+   * Lets the Benutzer view reflect an edit immediately (and keeps the cache
+   * alive) instead of invalidating it and depending on a working refresh.
+   *
+   * <p>Returns true if a matching row was updated. Rows that aren't
+   * jverein-desired-driven (HIK_ONLY/DELETE) keep their status; CREATE rows
+   * stay CREATE with a refreshed detail; everything else is re-diffed.
+   */
+  public static boolean recomputeRowOffline(Plan plan, Mitglied m, ChipStore chips) throws Exception
+  {
+    if (plan == null || m == null) return false;
+    Identity id = Identity.of(m);
+    String canon = Identity.canonical(id.employeeNo);
+    PlanRow d = null;
+    for (PlanRow r : plan.rows)
+      if (r.employeeNo != null && Identity.canonical(r.employeeNo).equals(canon)) { d = r; break; }
+    if (d == null) return false;   // not in the cached plan → will appear on next refresh
+
+    MitgliedAssignments.Assignment a;
+    try { a = MitgliedAssignments.load().get(m.getID()); }
+    catch (Exception e) { Logger.warn("recomputeRowOffline: assignment load failed: " + e.getMessage()); return false; }
+
+    HikvisionGroupCatalog cat = HikvisionGroupCatalog.fromCache();
+    Map<String, String>  uuidByGroupName = uuidByGroupName(cat);
+    Map<String, Integer> regionIdByName  = regionIdByName(cat);
+    Map<Integer, String> regionNameById  = regionNameById(cat);
+
+    d.isSponsor = id.isSponsor;
+    d.groupManaged = a != null && a.groupManaged;
+    d.storedGroupName = (a == null || a.hikvisionGroup == null) ? "" : a.hikvisionGroup;
+    d.desiredGroupName = autoGroupName(d.groupManaged, d.storedGroupName, d.isSponsor, d.groupName);
+    d.desiredGroupId = uuidByGroupName.get(d.desiredGroupName);
+
+    d.desiredRegionNames = (a == null) ? new ArrayList<>() : new ArrayList<>(a.regionPermissionGroups);
+    d.desiredRegionIds = resolveRegionIds(d.desiredRegionNames, regionIdByName, d.name, null);
+
+    List<String> desiredCards = new ArrayList<>();
+    if (a != null) for (String chip : a.transponder)
+    { String c = chips.cardForChip(chip); if (c != null) desiredCards.add(c); }
+    d.desiredCards = desiredCards;
+
+    Date austritt = m.getAustritt();
+    d.desiredValidEnd = austritt;
+    d.desiredEnabled = (austritt != null);
+
+    if (d.status == Status.HIK_ONLY || d.status == Status.DELETE) return true;   // not desired-driven
+    if (d.status == Status.CREATE)
+    {
+      d.detail = "neu auf Hikvision anlegen — Gruppe " + d.desiredGroupName
+          + (d.desiredRegionNames.isEmpty() ? "" : ", Berechtigung: " + String.join(",", d.desiredRegionNames))
+          + ", " + d.desiredCards.size() + " Karte(n)";
+      return true;
+    }
+    assignStatusAndDetail(d, chips, regionNameById);   // OK / UPDATE / DISABLE / REACTIVATE / (ex-)INCOMPLETE
+    return true;
+  }
+
   /** Decide DISABLE / REACTIVATE / UPDATE / OK for a row where both sides exist.
    *
    *  Rules (Hikvision Valid semantics):

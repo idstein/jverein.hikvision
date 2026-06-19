@@ -60,6 +60,7 @@ public class HikvisionBenutzerView extends AbstractView
   private org.eclipse.swt.widgets.Button dryRunCheckbox;
   private Text searchField;          // live full-text search across visible columns
   private java.util.List<SyncEngine.PlanRow> currentRows = java.util.Collections.emptyList();
+  private SyncEngine.Plan currentPlan;   // backing plan for currentRows (for offline edits + re-save)
   private ChipStore chipLookup;      // cached for renderRows so search/filter don't hit disk
   private java.util.Map<Integer, String> regionNameById = java.util.Collections.emptyMap();  // Berechtigungsgruppe id → name
   private final java.util.Set<String> unknownCardsLogged = new java.util.HashSet<>();
@@ -256,6 +257,7 @@ public class HikvisionBenutzerView extends AbstractView
       return;
     }
     currentRows = cached.plan.rows;
+    currentPlan = cached.plan;
     refreshChipLookup();
     countLabel.setText(summaryFor(cached.plan) + "  · letzter Abruf: " + formatAge(cached.timestamp));
     renderRows();
@@ -523,6 +525,7 @@ public class HikvisionBenutzerView extends AbstractView
 
       SyncEngine.Plan merged = SyncEngine.computePlanFor(scope, cached.plan, chips, client, listener(task, mon));
       currentRows = merged.rows;
+      currentPlan = merged;
       Display.getDefault().asyncExec(() -> {
         refreshChipLookup();
         if (countLabel != null && !countLabel.isDisposed())
@@ -548,6 +551,7 @@ public class HikvisionBenutzerView extends AbstractView
       { log("Kein Cache vorhanden — bitte zuerst Vollständig klicken.\n"); return; }
       SyncEngine.Plan merged = SyncEngine.computePlanFor(visible, cached.plan, chips, client, listener(task, mon));
       currentRows = merged.rows;
+      currentPlan = merged;
       Display.getDefault().asyncExec(() -> {
         refreshChipLookup();
         if (countLabel != null && !countLabel.isDisposed())
@@ -585,6 +589,7 @@ public class HikvisionBenutzerView extends AbstractView
   {
     SyncEngine.Plan plan = SyncEngine.computePlan(chips, client, listener(task, mon));
     currentRows = plan.rows;
+    currentPlan = plan;
     if (plan.userTotal >= 0 && plan.cardTotal >= 0)
       asn.recordFullRefresh(plan.userTotal, plan.cardTotal);
     Display.getDefault().asyncExec(() -> {
@@ -753,7 +758,10 @@ public class HikvisionBenutzerView extends AbstractView
   }
 
   /** Shared opener: load store + chip store, open the dialog, on save
-   *  invalidate the plan cache so the next Aktualisieren shows the new state. */
+   *  recompute the edited member's row offline (no controller call) so the
+   *  change shows immediately AND the cache stays intact — never delete the
+   *  PlanCache here, otherwise the view goes empty when a refresh isn't
+   *  currently possible. */
   private void openAssignmentDialogFor(de.jost_net.JVerein.rmi.Mitglied m) throws Exception
   {
     String vn = m.getVorname() == null ? "" : m.getVorname().trim();
@@ -767,10 +775,27 @@ public class HikvisionBenutzerView extends AbstractView
 
     boolean saved = AssignmentEditDialog.open(GUI.getShell(), store, chips,
         m.getID(), displayName, employeeNo, externe);
-    if (saved)
+    if (!saved) return;
+
+    boolean updated = false;
+    if (currentPlan != null)
     {
-      log("Zuweisung für " + displayName + " gespeichert. PlanCache invalidiert — bitte 'Aktualisieren' klicken.\n");
-      PlanCache.invalidate();
+      try { updated = SyncEngine.recomputeRowOffline(currentPlan, m, chips); }
+      catch (Exception e) { Logger.error("offline recompute failed", e); }
+    }
+    if (updated)
+    {
+      SyncEngine.recount(currentPlan);
+      PlanCache.save(currentPlan);
+      refreshChipLookup();
+      renderRows();
+      if (countLabel != null && !countLabel.isDisposed())
+        countLabel.setText(summaryFor(currentPlan) + "  · lokal aktualisiert (ohne Controller-Abruf)");
+      log("Zuweisung für " + displayName + " gespeichert und Ansicht lokal aktualisiert.\n");
+    }
+    else
+    {
+      log("Zuweisung für " + displayName + " gespeichert. Für den vollständigen Abgleich 'Aktualisieren' klicken.\n");
     }
   }
 
