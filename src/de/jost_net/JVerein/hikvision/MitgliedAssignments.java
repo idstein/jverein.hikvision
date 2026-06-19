@@ -26,22 +26,20 @@ import de.willuhn.jameica.system.Application;
 import de.willuhn.logging.Logger;
 
 /**
- * Plugin-owned per-Mitglied store. Holds the two pieces of data we no
- * longer want to live in jverein-Zusatzfeldern:
+ * Plugin-owned per-Mitglied store — the <b>source of truth</b> for what the
+ * sync pushes to Hikvision. Holds, per jverein Mitglied:
  *
- *  - transponder chip ids (replaces the {@code transponder} Zusatzfeld)
- *  - Hikvision user group ({@code Mitglieder}, {@code Vorstand},
- *    {@code Robby Bubble}, {@code BSV}) — drives userGroupNodeID on sync.
- *    Türrechte are NOT stored per Mitglied; the Hikvision controller
- *    derives access permissions from group membership automatically.
+ *  - transponder chip ids;
+ *  - the org userGroup ({@code Mitglieder} / {@code Vorstand} / {@code BSV} /
+ *    {@code Robby Bubble}) — see {@link Assignment#groupManaged};
+ *  - the door Berechtigungsgruppen ({@code regionPermissionGroups}) written
+ *    to each user's {@code regionPermissionGroupIDList} on sync.
  *
- * Backed by {@code cfg/MitgliedAssignments.json}, JSON-array of objects
- * keyed by {@code jvId} (the jverein Mitglied primary key).
- *
- * Migration: {@link #migrateFromZusatzfeld} populates the store from the
- * existing transponder Zusatzfeld + the latest Hikvision UserInfo
- * (read from {@link PlanCache}). One-shot — after first run, this file
- * is the source of truth.
+ * Backed by {@code cfg/MitgliedAssignments.json}, a JSON array of objects
+ * keyed by {@code jvId} (the jverein Mitglied primary key). Edited via the
+ * Benutzer view's assignment dialog; changes reach the controller only when
+ * a sync is run. {@link #syncAllToZusatzfeld} mirrors the transponder list
+ * back into the jverein Zusatzfeld for visibility (one direction only).
  */
 public class MitgliedAssignments
 {
@@ -330,187 +328,6 @@ public class MitgliedAssignments
     z.setFeld(value == null || value.isEmpty() ? null : value);
     z.store();
     return true;
-  }
-
-  // =====================================================================
-  // Migration: jverein Zusatzfeld + Hikvision UserInfo → MitgliedAssignments
-  // =====================================================================
-
-  public static class MigrationResult
-  {
-    public int created;
-    public int updated;
-    public int unchanged;
-    public int matchedFromHikvision;   // group came from PlanCache
-    public int defaultedActive;        // no PlanCache hit → fallback to Mitglieder group
-    public int defaultedSponsor;       // no PlanCache hit → fallback to BSV group
-    public int skippedNoRelevance;     // no transponder + no Hikvision record → no need to track
-    public int includedDeparted;       // austritt members with Hikvision record (kept for DISABLE)
-    public int orphansRemoved;         // store entries whose jvId was gone from jverein (overwrite mode only)
-    public int totalInStore;
-    public boolean planCacheAvailable;
-    public final List<String> warnings = new ArrayList<>();
-  }
-
-  /**
-   * Populates {@code MitgliedAssignments.json} from the existing
-   * {@code transponder} Zusatzfeld and the latest Hikvision UserInfo
-   * (read from {@link PlanCache}; if absent, falls back to defaults based
-   * on the sponsor flag).
-   *
-   * <p>By default this is non-destructive: assignments already in the
-   * store are preserved. Pass {@code overwriteExisting=true} to force a
-   * re-derivation (useful after major Hikvision-side changes).
-   *
-   * <p>The jverein Zusatzfeld is NOT modified — the migration is read-only
-   * against jverein, so it can be re-run safely.
-   */
-  public static MigrationResult migrateFromZusatzfeld(boolean overwriteExisting,
-                                                     ProgressListener pl) throws Exception
-  {
-    MigrationResult r = new MigrationResult();
-    MitgliedAssignments store = load();
-
-    DBIterator<Felddefinition> defs = Einstellungen.getDBService().createList(Felddefinition.class);
-    defs.addFilter("name = ?", HikvisionSettings.getZusatzfeldName());
-    if (!defs.hasNext())
-      throw new IllegalStateException("Felddefinition '" + HikvisionSettings.getZusatzfeldName()
-          + "' nicht gefunden in jverein");
-    Felddefinition transponderDef = (Felddefinition) defs.next();
-    String transponderDefId = transponderDef.getID();
-
-    // id → name for the controller's region-permission groups, so we can
-    // record each user's CURRENT Berechtigungsgruppen by name (preserving
-    // them — otherwise the first sync would wipe the individually-assigned
-    // door access of members whose store entry has none yet).
-    Map<Integer, String> regionNameById = new HashMap<>();
-    for (HikvisionGroupCatalog.RegionPermissionGroup rp : HikvisionGroupCatalog.fromCache().regions)
-      if (rp.name != null && !rp.name.isEmpty()) regionNameById.put(rp.id, rp.name);
-
-    Map<String, String> groupByEmp = new HashMap<>();
-    Map<String, List<String>> regionsByEmp = new HashMap<>();
-    PlanCache.Cached cached = PlanCache.load();
-    if (cached != null && cached.plan != null)
-    {
-      for (SyncEngine.PlanRow row : cached.plan.rows)
-      {
-        if (row.employeeNo == null || row.employeeNo.isEmpty()) continue;
-        String canon = Identity.canonical(row.employeeNo);
-        if (row.groupName != null && !row.groupName.isEmpty())
-          groupByEmp.put(canon, row.groupName);
-        if (row.currentRegionIds != null && !row.currentRegionIds.isEmpty())
-        {
-          List<String> names = new ArrayList<>();
-          for (Integer id : row.currentRegionIds)
-          {
-            String nm = regionNameById.get(id);
-            if (nm != null && !nm.isEmpty() && !names.contains(nm)) names.add(nm);
-          }
-          if (!names.isEmpty()) regionsByEmp.put(canon, names);
-        }
-      }
-      r.planCacheAvailable = true;
-      pl.log("PlanCache: " + groupByEmp.size() + " employeeNo → Organisationsgruppe, "
-          + regionsByEmp.size() + " mit Berechtigungsgruppen bekannt");
-    }
-    else
-    {
-      pl.log("WARN: kein PlanCache — alle Mitglieder fallen auf Defaults (active→"
-          + HikvisionSettings.getMemberGroupName() + ", sponsor→"
-          + HikvisionSettings.getSponsorGroupName() + ") zurück. "
-          + "Erst Benutzer-Ansicht aktualisieren empfohlen.");
-    }
-
-    DBIterator<Mitglied> it = Einstellungen.getDBService().createList(Mitglied.class);
-    int seen = 0;
-    java.util.Set<String> jvereinIds = new java.util.HashSet<>();
-    while (it.hasNext())
-    {
-      Mitglied m = (Mitglied) it.next();
-      seen++;
-
-      String jvId = m.getID();
-      jvereinIds.add(jvId);
-      Assignment existing = store.get(jvId);
-      if (existing != null && !overwriteExisting) { r.unchanged++; continue; }
-
-      List<String> transponder = new ArrayList<>();
-      String chipsRaw = readZusatzfeld(jvId, transponderDefId);
-      if (chipsRaw != null && !chipsRaw.isEmpty()
-          && !chipsRaw.equals("0") && !chipsRaw.equalsIgnoreCase("null"))
-      {
-        for (String c : chipsRaw.split(","))
-        {
-          String t = c.trim();
-          if (!t.isEmpty()) transponder.add(t);
-        }
-      }
-
-      Identity id = Identity.of(m);
-      String hikGroup = groupByEmp.get(id.employeeNo);
-      boolean hasHikvisionRecord = hikGroup != null && !hikGroup.isEmpty();
-
-      // Filter: only track Mitglieder who have or had a Hikvision presence.
-      // Members with no transponder AND no record on the controller are
-      // irrelevant — they'll appear live in the Benutzer view from jverein
-      // once they get a chip, and an assignment is created at that point.
-      if (transponder.isEmpty() && !hasHikvisionRecord)
-      { r.skippedNoRelevance++; continue; }
-
-      if (m.getAustritt() != null) r.includedDeparted++;
-
-      if (hasHikvisionRecord)
-      {
-        r.matchedFromHikvision++;
-      }
-      else
-      {
-        // Has transponder but no existing record yet → first-time CREATE on
-        // next sync. Group default by sponsor flag.
-        if (id.isSponsor)
-        { hikGroup = HikvisionSettings.getSponsorGroupName(); r.defaultedSponsor++; }
-        else
-        { hikGroup = HikvisionSettings.getMemberGroupName();  r.defaultedActive++; }
-      }
-
-      Assignment a = new Assignment(jvId);
-      a.externe = m.getExterneMitgliedsnummer() == null ? "" : m.getExterneMitgliedsnummer().trim();
-      a.employeeNo = id.employeeNo;
-      a.transponder.addAll(transponder);
-      a.hikvisionGroup = hikGroup;
-      // Preserve any door-access groups the user already has on the controller.
-      List<String> seededRegions = regionsByEmp.get(id.employeeNo);
-      if (seededRegions != null) a.regionPermissionGroups.addAll(seededRegions);
-
-      store.put(a);
-      if (existing == null) r.created++; else r.updated++;
-    }
-
-    // Orphan cleanup (overwrite-only): drop store entries whose jvId is no
-    // longer in jverein. Required for true idempotence when a Mitglied is
-    // deleted from jverein — without this, the orphan entry would linger
-    // forever and run #2 would still see it.
-    if (overwriteExisting)
-    {
-      java.util.List<String> orphanJvIds = new java.util.ArrayList<>();
-      for (Assignment a : store.all())
-        if (!jvereinIds.contains(a.jvId)) orphanJvIds.add(a.jvId);
-      for (String j : orphanJvIds) store.remove(j);
-      r.orphansRemoved = orphanJvIds.size();
-    }
-
-    store.save();
-    r.totalInStore = store.size();
-    pl.log("Migration: " + seen + " Mitglieder durchlaufen → " + r.totalInStore
-        + " Zuweisungen im Store (created=" + r.created + " updated=" + r.updated
-        + " unchanged=" + r.unchanged
-        + " orphan-removed=" + r.orphansRemoved
-        + " skipped(no transponder + no Hikvision record)=" + r.skippedNoRelevance
-        + " austritt-mit-Hikvision-Record=" + r.includedDeparted
-        + " matched-from-hikvision=" + r.matchedFromHikvision
-        + " defaulted-active=" + r.defaultedActive
-        + " defaulted-sponsor=" + r.defaultedSponsor + ")");
-    return r;
   }
 
   private static String readZusatzfeld(String mitgliedId, String felddefinitionId) throws Exception

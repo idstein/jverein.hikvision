@@ -70,7 +70,6 @@ public class SettingsView implements Extension
   private LabelInput statusLabel;
   private Button testBtn;
   private Button fetchBtn;
-  private Button migrateBtn;
 
   private HikvisionGroupCatalog catalog;
   private MessageConsumer consumer;
@@ -170,17 +169,14 @@ public class SettingsView implements Extension
       @Override public void widgetSelected(SelectionEvent e) { onFetch(); }
     });
 
-    // ----- Mirror sync between jverein Zusatzfeld and MitgliedAssignments
-    // Both flows are idempotent (running twice gives the same result).
+    // ----- Mirror plugin store → jverein Zusatzfeld (one direction only).
+    // The plugin store (MitgliedAssignments) is the source of truth; the only
+    // remaining mirror exports the transponder list back into jverein so its
+    // Mitglied detail view shows it. Importing FROM the Zusatzfeld was removed
+    // — it overwrote the authoritative store with the (often empty) Zusatzfeld.
     Composite migRow = new Composite(tab.getComposite(), SWT.NONE);
     migRow.setLayoutData(new GridData(SWT.FILL, SWT.CENTER, true, false, 2, 1));
-    migRow.setLayout(new GridLayout(2, true));
-    migrateBtn = new Button(migRow, SWT.PUSH);
-    migrateBtn.setText("Von Zusatzfeld importieren");
-    migrateBtn.setLayoutData(new GridData(SWT.FILL, SWT.CENTER, true, false));
-    migrateBtn.addSelectionListener(new SelectionAdapter() {
-      @Override public void widgetSelected(SelectionEvent e) { onMigrate(); }
-    });
+    migRow.setLayout(new GridLayout(1, true));
     Button writeBackBtn = new Button(migRow, SWT.PUSH);
     writeBackBtn.setText("Zu Zusatzfeld exportieren");
     writeBackBtn.setLayoutData(new GridData(SWT.FILL, SWT.CENTER, true, false));
@@ -298,67 +294,6 @@ public class SettingsView implements Extension
     t.setDaemon(true); t.start();
   }
 
-  /**
-   * Flow (a): full rebuild of {@code MitgliedAssignments.json} from the
-   * jverein Zusatzfeld + latest Hikvision PlanCache. Idempotent —
-   * existing entries are overwritten with what jverein + cache say.
-   * Manual edits to the assignment store (group choice via the dialog)
-   * are lost; the canonical source after this is the Zusatzfeld + cache.
-   */
-  private void onMigrate()
-  {
-    MessageBox confirm = new MessageBox(GUI.getShell(), SWT.ICON_QUESTION | SWT.YES | SWT.NO);
-    confirm.setText("Von Zusatzfeld importieren");
-    confirm.setMessage("Liest für jedes aktive Mitglied das Zusatzfeld '"
-        + HikvisionSettings.getZusatzfeldName() + "' (Transponder) und übernimmt aus dem "
-        + "letzten Hikvision-Aktualisierungslauf die aktuelle Gruppenzuordnung.\n\n"
-        + "ÜBERSCHREIBT bestehende Einträge in MitgliedAssignments — manuelle "
-        + "Gruppen- oder Transponder-Änderungen aus dem Dialog werden zurückgesetzt.\n"
-        + "Das jverein-Zusatzfeld bleibt unverändert.\n\n"
-        + "Idempotent — kann gefahrlos mehrfach ausgeführt werden.\n\nFortfahren?");
-    if (confirm.open() != SWT.YES) return;
-
-    migrateBtn.setEnabled(false);
-    Thread t = new Thread(() -> {
-      try
-      {
-        MitgliedAssignments.MigrationResult r = MitgliedAssignments.migrateFromZusatzfeld(true,
-            new ProgressListener() {
-              @Override public void log(String msg) { Logger.info(msg); }
-              @Override public void progress(int done, int total) {}
-              @Override public void progress(int done, int total, String phase) {}
-            });
-        StringBuilder sb = new StringBuilder();
-        sb.append("Im Store: ").append(r.totalInStore).append(" Zuweisungen\n");
-        sb.append("Neu angelegt: ").append(r.created).append("\n");
-        sb.append("Aktualisiert: ").append(r.updated).append("\n");
-        sb.append("Unverändert (bereits vorhanden): ").append(r.unchanged).append("\n");
-        sb.append("Mit Hikvision-Cache abgeglichen: ").append(r.matchedFromHikvision).append("\n");
-        sb.append("Default Mitglieder: ").append(r.defaultedActive).append("\n");
-        sb.append("Default Sponsor: ").append(r.defaultedSponsor).append("\n");
-        sb.append("Austritt-Mitglieder mit Hikvision-Record (für DISABLE): ").append(r.includedDeparted).append("\n");
-        sb.append("Übersprungen (kein Transponder + kein Hikvision-Record): ").append(r.skippedNoRelevance).append("\n");
-        sb.append("Orphan-Einträge entfernt (jvId nicht mehr in jverein): ").append(r.orphansRemoved).append("\n");
-        if (!r.planCacheAvailable)
-          sb.append("\nHINWEIS: kein PlanCache gefunden — alle Gruppen sind Defaults. "
-              + "Erst in Benutzer-Ansicht 'Aktualisieren' klicken und Migration erneut ausführen.");
-        sb.append("\n\nDatei: ").append(MitgliedAssignments.defaultFile().getAbsolutePath());
-        showInfo("Migration abgeschlossen", sb.toString());
-      }
-      catch (Exception e)
-      {
-        Logger.error("MitgliedAssignments migration failed", e);
-        showError("Migration fehlgeschlagen", e.getClass().getSimpleName() + ": " + e.getMessage());
-      }
-      finally
-      {
-        Display.getDefault().asyncExec(() -> {
-          if (migrateBtn != null && !migrateBtn.isDisposed()) migrateBtn.setEnabled(true);
-        });
-      }
-    }, "jverein.hikvision-migrate-assignments");
-    t.setDaemon(true); t.start();
-  }
 
   /**
    * Bulk mirror: walks every active jverein Mitglied and writes their
