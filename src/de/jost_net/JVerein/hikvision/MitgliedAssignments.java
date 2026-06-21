@@ -132,7 +132,14 @@ public class MitgliedAssignments
       if (rg != null) for (int j = 0; j < rg.length(); j++)
       {
         String t = rg.optString(j, "").trim();
-        if (!t.isEmpty() && !a.regionPermissionGroups.contains(t)) a.regionPermissionGroups.add(t);
+        if (t.isEmpty() || a.regionPermissionGroups.contains(t)) continue;
+        // Self-heal: a Berechtigungsgruppe equal to the member's Org-Gruppe is
+        // redundant (the userGroup already grants that group's door access) —
+        // drop it on load so a stale/over-assigned store doesn't push a
+        // pointless regionPermissionGroupIDList. Genuine exceptions (a region
+        // that differs from the Org-Gruppe) are kept.
+        if (a.hikvisionGroup != null && t.equalsIgnoreCase(a.hikvisionGroup.trim())) continue;
+        a.regionPermissionGroups.add(t);
       }
       byJvId.put(jvId, a);
     }

@@ -281,11 +281,16 @@ public final class AssignmentEditDialog
           my.externe = externe == null ? "" : externe;
           my.transponder.clear();
           my.transponder.addAll(selected);
-          my.regionPermissionGroups.clear();
-          my.regionPermissionGroups.addAll(selectedRegions);
           String chosenGroup = groupCombo.getText().trim();
           if (chosenGroup.isEmpty()) chosenGroup = defaultGroup;
           my.hikvisionGroup = chosenGroup;
+          // A Berechtigungsgruppe equal to the Org-Gruppe is redundant — the
+          // Org-Gruppe (userGroup) already grants that group's door access.
+          // Drop it so we never push a pointless regionPermissionGroupIDList.
+          final String orgGroup = chosenGroup;
+          selectedRegions.removeIf(rn -> rn.equalsIgnoreCase(orgGroup));
+          my.regionPermissionGroups.clear();
+          my.regionPermissionGroups.addAll(selectedRegions);
           // Only mark as explicitly managed when the user actually changed the
           // group — otherwise leave it to the automatic rule (so e.g. opening a
           // member who is wrongly in BSV and saving doesn't "bless" BSV).
