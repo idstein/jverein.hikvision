@@ -56,7 +56,7 @@ public class HikvisionBenutzerView extends AbstractView
   private Combo filterCombo;
   private ProgressBar progress;
   private Text logArea;
-  private Button refreshBtn, refreshVisibleBtn, refreshFullBtn, syncBtn;
+  private Button refreshBtn, refreshVisibleBtn, syncBtn;
   private org.eclipse.swt.widgets.Button dryRunCheckbox;
   private Text searchField;          // live full-text search across visible columns
   private java.util.List<SyncEngine.PlanRow> currentRows = java.util.Collections.emptyList();
@@ -75,10 +75,9 @@ public class HikvisionBenutzerView extends AbstractView
     Composite c = parent;
 
     Label info = new Label(c, SWT.WRAP);
-    info.setText("Diff-Übersicht: was würde der nächste Sync (jverein → Hikvision) tun? "
+    info.setText("Diff-Übersicht: was würde 'Übertragen' (jverein → Hikvision) tun? "
         + "Filter unten links wählt die Aktion. Letzter Stand wird aus lokalem Cache geladen. "
-        + "Aktualisieren (inkrementell, schnell) · Sichtbare aktualisieren (gefilterte Zeilen) · "
-        + "Vollständig (alles, ~80 s).");
+        + "Aktualisieren prüft den Abgleich neu; Übertragen schreibt nur die nicht-synchronen Zeilen.");
     GridData infoGd = new GridData(SWT.FILL, SWT.CENTER, true, false, 2, 1);
     infoGd.widthHint = 800;
     info.setLayoutData(infoGd);
@@ -86,35 +85,29 @@ public class HikvisionBenutzerView extends AbstractView
     // --- toolbar (refresh modes / filter / count) ---
     Composite toolbar = new Composite(c, SWT.NONE);
     toolbar.setLayoutData(new GridData(SWT.FILL, SWT.CENTER, true, false, 2, 1));
-    toolbar.setLayout(new GridLayout(6, false));
+    toolbar.setLayout(new GridLayout(5, false));
 
     refreshBtn = new Button(toolbar, SWT.PUSH);
     refreshBtn.setText("Aktualisieren");
-    refreshBtn.setToolTipText("Inkrementell: nur Nicht-OK Zeilen und kürzlich geänderte Zuweisungen. "
-        + "Wechselt automatisch auf Vollständig wenn Cache fehlt oder die Hikvision-Gesamtzahl abweicht.");
+    refreshBtn.setToolTipText("Prüft den Abgleich mit Hikvision neu (inkrementell: nur Nicht-synchrone Zeilen "
+        + "und kürzlich geänderte Zuweisungen; holt automatisch alles, wenn Cache fehlt oder die "
+        + "Hikvision-Gesamtzahl abweicht).");
     refreshBtn.addSelectionListener(new SelectionAdapter() {
       @Override public void widgetSelected(SelectionEvent e) { onRefreshIncremental(); }
     });
 
     refreshVisibleBtn = new Button(toolbar, SWT.PUSH);
-    refreshVisibleBtn.setText("Sichtbare aktualisieren");
-    refreshVisibleBtn.setToolTipText("Aktualisiert nur die aktuell in der Tabelle angezeigten Zeilen (Filter+Suche berücksichtigt).");
+    refreshVisibleBtn.setText("Schnelles Aktualisieren");
+    refreshVisibleBtn.setToolTipText("Schnell: prüft nur die aktuell angezeigten Zeilen neu (Filter+Suche berücksichtigt).");
     refreshVisibleBtn.addSelectionListener(new SelectionAdapter() {
       @Override public void widgetSelected(SelectionEvent e) { onRefreshVisible(); }
-    });
-
-    refreshFullBtn = new Button(toolbar, SWT.PUSH);
-    refreshFullBtn.setText("Vollständig");
-    refreshFullBtn.setToolTipText("Holt alle Benutzer und Karten neu vom Controller (~80 s bei ~560 Benutzern).");
-    refreshFullBtn.addSelectionListener(new SelectionAdapter() {
-      @Override public void widgetSelected(SelectionEvent e) { onRefreshFull(); }
     });
 
     new Label(toolbar, SWT.NONE).setText("Filter:");
     filterCombo = new Combo(toolbar, SWT.READ_ONLY | SWT.DROP_DOWN);
     filterCombo.setItems(new String[] {
         "Alle",
-        "Nicht OK (Aktion nötig)",
+        "Nicht synchron (Aktion nötig)",
         "Nur neu (CREATE)",
         "Nur geändert (UPDATE)",
         "Nur deaktivieren (DISABLE)",
@@ -232,8 +225,9 @@ public class HikvisionBenutzerView extends AbstractView
     dryRunCheckbox.setLayoutData(new GridData(SWT.LEFT, SWT.CENTER, false, false));
 
     syncBtn = new Button(actionRow, SWT.PUSH);
-    syncBtn.setText("Jetzt synchronisieren");
-    syncBtn.setToolTipText("jverein → Hikvision");
+    syncBtn.setText("Übertragen");
+    syncBtn.setToolTipText("Schreibt nur die nicht-synchronen Zeilen (jverein → Hikvision) — ohne erneuten Abruf. "
+        + "Vorher 'Aktualisieren', wenn der Abgleich neu geprüft werden soll.");
     syncBtn.setLayoutData(new GridData(SWT.FILL, SWT.CENTER, true, false));
     syncBtn.addSelectionListener(new SelectionAdapter() {
       @Override public void widgetSelected(SelectionEvent e) { onSync(); }
@@ -585,13 +579,13 @@ public class HikvisionBenutzerView extends AbstractView
     final boolean dry = dryRunCheckbox.getSelection();
     java.util.Set<String> visible = currentlyVisibleEmployeeNos();
     if (visible.isEmpty())
-    { info("Keine Zeilen sichtbar", "Es gibt nichts zu aktualisieren — Filter/Suche leeren oder Vollständig nutzen."); return; }
-    startTask("Aktualisieren (sichtbare: " + visible.size() + ")", dry, (task, mon) -> {
+    { info("Keine Zeilen sichtbar", "Es gibt nichts zu aktualisieren — Filter/Suche leeren oder 'Aktualisieren' nutzen."); return; }
+    startTask("Schnelles Aktualisieren (" + visible.size() + " sichtbar)", dry, (task, mon) -> {
       ChipStore chips = ChipStore.defaultStore();
       HikvisionClient client = buildClient(task);
       PlanCache.Cached cached = PlanCache.load();
       if (cached == null || cached.plan == null)
-      { log("Kein Cache vorhanden — bitte zuerst Vollständig klicken.\n"); return; }
+      { log("Kein Cache vorhanden — bitte zuerst 'Aktualisieren' klicken.\n"); return; }
       SyncEngine.Plan merged = SyncEngine.computePlanFor(visible, cached.plan, chips, client, listener(task, mon));
       currentRows = merged.rows;
       currentPlan = merged;
@@ -604,17 +598,6 @@ public class HikvisionBenutzerView extends AbstractView
     });
   }
 
-  /** Explicit full refresh — hits all users + cards, records totals + timestamp. */
-  private void onRefreshFull()
-  {
-    final boolean dry = dryRunCheckbox.getSelection();
-    startTask("Aktualisieren (vollständig)", dry, (task, mon) -> {
-      ChipStore chips = ChipStore.defaultStore();
-      HikvisionClient client = buildClient(task);
-      MitgliedAssignments asn = MitgliedAssignments.load();
-      runFullRefresh(asn, chips, client, task, mon);
-    });
-  }
 
   /** Build a controller client wired to {@code task}'s cancel flag and the
    *  configured retry/deadline knobs, so every call (escalation count-probe,
@@ -876,12 +859,20 @@ public class HikvisionBenutzerView extends AbstractView
   private void onSync()
   {
     final boolean dry = dryRunCheckbox.getSelection();   // UI thread — capture before submitting
-    startTask("Zugangssystem Sync", dry, (task, mon) -> {
-      SyncEngine.Result r = SyncEngine.run(dry, listener(task, mon));
-      log("\nFertig (Sync). created=" + r.created + " deleted=" + r.deleted
+    final SyncEngine.Plan inMemory = currentPlan;        // reflects offline edits
+    startTask("Übertragen", dry, (task, mon) -> {
+      // Apply the already-computed diff — NO controller fetch. The in-memory
+      // plan reflects the latest offline edits; fall back to the disk cache.
+      SyncEngine.Plan plan = inMemory;
+      if (plan == null)
+      { PlanCache.Cached c = PlanCache.load(); plan = (c == null) ? null : c.plan; }
+      if (plan == null)
+      { log("\nKein Abgleich vorhanden — bitte zuerst 'Aktualisieren' klicken.\n"); return; }
+      SyncEngine.Result r = SyncEngine.applyCached(plan, dry, listener(task, mon));
+      log("\nFertig (Übertragen). created=" + r.created + " deleted=" + r.deleted
           + " cardsAdded=" + r.cardsAdded + " cardsRemoved=" + r.cardsRemoved
           + " errors=" + r.errors.size() + "\n");
-      // refresh cache view post-sync
+      // reflect the post-apply state (foldAppliedIntoCache saved it)
       Display.getDefault().asyncExec(this::loadCachedPlan);
     });
   }
@@ -966,7 +957,6 @@ public class HikvisionBenutzerView extends AbstractView
   {
     if (refreshBtn != null && !refreshBtn.isDisposed()) refreshBtn.setEnabled(en);
     if (refreshVisibleBtn != null && !refreshVisibleBtn.isDisposed()) refreshVisibleBtn.setEnabled(en);
-    if (refreshFullBtn != null && !refreshFullBtn.isDisposed()) refreshFullBtn.setEnabled(en);
     if (syncBtn != null && !syncBtn.isDisposed()) syncBtn.setEnabled(en);
   }
 

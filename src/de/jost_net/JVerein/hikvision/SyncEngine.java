@@ -960,23 +960,58 @@ public class SyncEngine
 
   // ============================================================ run
 
+  /** Full sync: re-fetch the entire controller state, recompute the plan, then
+   *  apply. Pulls all users + all cards (~80s) — use only when no cached plan
+   *  is available. The interactive "Übertragen" button uses {@link #applyCached}
+   *  instead so a single pending change doesn't trigger a full fetch. */
   public static Result run(boolean dryRun, de.jost_net.JVerein.hikvision.ProgressListener pl) throws Exception
   {
-    Result r = new Result();
-    r.dryRun = dryRun;
-    pl.log("=== Sync " + (dryRun ? "(DRY-RUN)" : "(APPLY)") + " ===");
-
+    pl.log("=== Sync " + (dryRun ? "(DRY-RUN)" : "(APPLY)") + " (vollständig) ===");
+    HikvisionClient client = buildClient(pl);
     ChipStore chips = ChipStore.defaultStore();
+    Plan plan = computePlan(chips, client, pl);
+    return applyPlan(plan, dryRun, client, pl);
+  }
+
+  /** Apply an already-computed plan (the cached Benutzer-view diff) WITHOUT any
+   *  controller fetch — writes only the out-of-sync rows. This is what
+   *  "Übertragen" runs: the displayed plan already says what differs, so syncing
+   *  just writes those rows instead of pulling all users + all cards first.
+   *  Refresh the view (Aktualisieren) when you need the diff re-checked. */
+  public static Result applyCached(Plan plan, boolean dryRun,
+                                   de.jost_net.JVerein.hikvision.ProgressListener pl) throws Exception
+  {
+    pl.log("=== Sync " + (dryRun ? "(DRY-RUN)" : "(APPLY)") + " (nur offene Aktionen) ===");
+    if (plan == null)
+    {
+      Result r = new Result(); r.dryRun = dryRun;
+      pl.log("Kein Plan im Cache — bitte zuerst 'Aktualisieren' klicken.");
+      return r;
+    }
+    return applyPlan(plan, dryRun, buildClient(pl), pl);
+  }
+
+  /** Controller client wired to the task's cancel flag + configured
+   *  retry/deadline knobs, so a wedged call can't hang Jameica's task slot. */
+  private static HikvisionClient buildClient(de.jost_net.JVerein.hikvision.ProgressListener pl)
+  {
     HikvisionClient client = new HikvisionClient(
         HikvisionSettings.getControllerUrl(), HikvisionSettings.getControllerUser(),
         HikvisionSettings.getControllerPassword(), HikvisionSettings.getInterCallPauseMs(),
         HikvisionSettings.getVerifySsl());
-    // Make every controller call honour the cancel button and the configured
-    // retry/deadline knobs, so a wedged call can't hang the task slot.
     client.setCancelCheck(pl::isCancelled);
     client.setResilience(HikvisionSettings.getMaxAttempts(), HikvisionSettings.getCallDeadlineMs());
+    return client;
+  }
 
-    Plan plan = computePlan(chips, client, pl);
+  /** Walk the plan and write only the actionable rows (OK / HIK_ONLY /
+   *  INCOMPLETE are no-ops). On full success folds the applied changes into the
+   *  cache (no re-fetch); on partial failure invalidates it. */
+  private static Result applyPlan(Plan plan, boolean dryRun, HikvisionClient client,
+                                  de.jost_net.JVerein.hikvision.ProgressListener pl) throws Exception
+  {
+    Result r = new Result();
+    r.dryRun = dryRun;
     int total = plan.rows.size();
     int done = 0;
     pl.progress(done, total, "Sync läuft");
