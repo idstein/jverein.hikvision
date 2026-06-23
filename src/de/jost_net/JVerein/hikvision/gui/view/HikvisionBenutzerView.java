@@ -122,7 +122,9 @@ public class HikvisionBenutzerView extends AbstractView
         "Nur löschen (DELETE)",
         "Nur unvollständig (INCOMPLETE)",
         "Nur unverwaltet (HIK_ONLY)",
-        "Nur in sync (OK)" });
+        "Nur in sync (OK)",
+        "Zugang beendet (Austritt/abgelaufen)",
+        "Ohne Transponder" });
     filterCombo.select(1);   // default to "Nicht OK" — that's the actionable view
     filterCombo.addSelectionListener(new SelectionAdapter() {
       @Override public void widgetSelected(SelectionEvent e) { renderRows(); }
@@ -332,8 +334,11 @@ public class HikvisionBenutzerView extends AbstractView
   {
     if (table == null || table.isDisposed()) return;
     table.removeAll();
+    int sel = filterCombo.getSelectionIndex();
+    final boolean onlyEnded = sel == 10;          // Zugang beendet (Austritt/abgelaufen)
+    final boolean onlyNoTransponder = sel == 11;  // Ohne Transponder
     java.util.Set<SyncEngine.Status> wanted;
-    switch (filterCombo.getSelectionIndex())
+    switch (sel)
     {
       case 1: // Nicht OK — anything that needs an action
         wanted = java.util.EnumSet.of(SyncEngine.Status.CREATE, SyncEngine.Status.UPDATE,
@@ -348,12 +353,16 @@ public class HikvisionBenutzerView extends AbstractView
       case 7: wanted = java.util.EnumSet.of(SyncEngine.Status.INCOMPLETE); break;
       case 8: wanted = java.util.EnumSet.of(SyncEngine.Status.HIK_ONLY);   break;
       case 9: wanted = java.util.EnumSet.of(SyncEngine.Status.OK);         break;
-      default: wanted = null;
+      default: wanted = null;   // 0 (Alle), 10, 11 → handled by the predicates below
     }
     String q = (searchField == null || searchField.isDisposed()) ? "" : searchField.getText().trim().toLowerCase();
     for (SyncEngine.PlanRow r : currentRows)
     {
+      boolean ended = SyncEngine.computeAccessEnded(r);
+      r.accessEnded = ended;   // keep the row in step with "as of now"
       if (wanted != null && !wanted.contains(r.status)) continue;
+      if (onlyEnded && !ended) continue;
+      if (onlyNoTransponder && !hasNoTransponder(r)) continue;
       String emp = r.employeeNo == null ? "" : r.employeeNo;
       String nm  = r.name == null ? "" : r.name;
       String ty  = r.userType == null ? "" : r.userType;
@@ -365,13 +374,14 @@ public class HikvisionBenutzerView extends AbstractView
       String ber    = renderRegionsInline(r, managed);
       String transp = renderTransponderInline(r, managed);
       String det = composeDetail(r);
+      String statusCell = statusCellLabel(r, ended);
       if (!q.isEmpty())
       {
-        String haystack = (emp + " " + nm + " " + ty + " " + gp + " " + ber + " " + transp + " " + det).toLowerCase();
+        String haystack = (statusCell + " " + emp + " " + nm + " " + ty + " " + gp + " " + ber + " " + transp + " " + det).toLowerCase();
         if (!haystack.contains(q)) continue;
       }
       TableItem ti = new TableItem(table, SWT.NONE);
-      ti.setText(0, statusLabel(r.status));
+      ti.setText(0, statusCell);
       ti.setText(1, emp);
       ti.setText(2, nm);
       ti.setText(3, ty);
@@ -392,6 +402,15 @@ public class HikvisionBenutzerView extends AbstractView
   private String composeDetail(SyncEngine.PlanRow r)
   {
     String det = r.detail == null ? "" : r.detail;
+    if (SyncEngine.computeAccessEnded(r))
+    {
+      String when = fmtDate(r.currentValidEnd);
+      String note = "Zugang beendet" + (when.isEmpty() ? "" : " am " + when)
+          + " — Eintrag bleibt für Zutritts-Historie erhalten";
+      // In-sync rows carry the bland "in sync" detail — replace it with the
+      // more informative ended note; otherwise prepend it.
+      det = (det.isEmpty() || det.equals("in sync")) ? note : (note + "  ·  " + det);
+    }
     java.util.List<String> unk = unknownCardsByEmp.get(r.employeeNo);
     if (unk == null || unk.isEmpty()) return det;
     if (r.status == SyncEngine.Status.DELETE) return det;   // whole row goes away
@@ -480,6 +499,30 @@ public class HikvisionBenutzerView extends AbstractView
     return sb.toString();
   }
 
+  /** Status column text. When the controller is actively blocking a user on an
+   *  expired validity window we surface "ZUGANG BEENDET" instead of a bare
+   *  "OK" (the sync action genuinely is "nothing to do"); if an action is also
+   *  pending we keep the action label and append a marker. */
+  private static String statusCellLabel(SyncEngine.PlanRow r, boolean ended)
+  {
+    if (!ended) return statusLabel(r.status);
+    return r.status == SyncEngine.Status.OK ? "ZUGANG BEENDET" : statusLabel(r.status) + " ⏹";
+  }
+
+  /** True when neither the controller side nor the desired side holds any
+   *  transponder — the user/member currently can't badge in. */
+  private static boolean hasNoTransponder(SyncEngine.PlanRow r)
+  {
+    boolean cur = r.currentCards == null || r.currentCards.isEmpty();
+    boolean des = r.desiredCards == null || r.desiredCards.isEmpty();
+    return cur && des;
+  }
+
+  private static String fmtDate(java.util.Date d)
+  {
+    return d == null ? "" : new java.text.SimpleDateFormat("yyyy-MM-dd").format(d);
+  }
+
   private static String statusLabel(SyncEngine.Status s)
   {
     if (s == null) return "?";
@@ -506,7 +549,7 @@ public class HikvisionBenutzerView extends AbstractView
     final boolean dry = dryRunCheckbox.getSelection();
     startTask("Aktualisieren (inkrementell)", dry, (task, mon) -> {
       ChipStore chips = ChipStore.defaultStore();
-      HikvisionClient client = buildClient();
+      HikvisionClient client = buildClient(task);
 
       MitgliedAssignments asn = MitgliedAssignments.load();
       PlanCache.Cached cached = PlanCache.load();
@@ -545,7 +588,7 @@ public class HikvisionBenutzerView extends AbstractView
     { info("Keine Zeilen sichtbar", "Es gibt nichts zu aktualisieren — Filter/Suche leeren oder Vollständig nutzen."); return; }
     startTask("Aktualisieren (sichtbare: " + visible.size() + ")", dry, (task, mon) -> {
       ChipStore chips = ChipStore.defaultStore();
-      HikvisionClient client = buildClient();
+      HikvisionClient client = buildClient(task);
       PlanCache.Cached cached = PlanCache.load();
       if (cached == null || cached.plan == null)
       { log("Kein Cache vorhanden — bitte zuerst Vollständig klicken.\n"); return; }
@@ -567,18 +610,25 @@ public class HikvisionBenutzerView extends AbstractView
     final boolean dry = dryRunCheckbox.getSelection();
     startTask("Aktualisieren (vollständig)", dry, (task, mon) -> {
       ChipStore chips = ChipStore.defaultStore();
-      HikvisionClient client = buildClient();
+      HikvisionClient client = buildClient(task);
       MitgliedAssignments asn = MitgliedAssignments.load();
       runFullRefresh(asn, chips, client, task, mon);
     });
   }
 
-  private HikvisionClient buildClient()
+  /** Build a controller client wired to {@code task}'s cancel flag and the
+   *  configured retry/deadline knobs, so every call (escalation count-probe,
+   *  full/incremental/visible fetch, sync) aborts promptly on cancel and can
+   *  never wedge the single background-task slot. */
+  private HikvisionClient buildClient(BackgroundTask task)
   {
-    return new HikvisionClient(
+    HikvisionClient client = new HikvisionClient(
         HikvisionSettings.getControllerUrl(), HikvisionSettings.getControllerUser(),
         HikvisionSettings.getControllerPassword(), HikvisionSettings.getInterCallPauseMs(),
         HikvisionSettings.getVerifySsl());
+    if (task != null) client.setCancelCheck(task::isInterrupted);
+    client.setResilience(HikvisionSettings.getMaxAttempts(), HikvisionSettings.getCallDeadlineMs());
+    return client;
   }
 
   /** Common full-refresh body, used both by the explicit button and the

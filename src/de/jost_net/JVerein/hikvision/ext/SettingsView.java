@@ -67,6 +67,8 @@ public class SettingsView implements Extension
 
   private TextInput zusatzfeldName;
   private IntegerInput interCallPauseMs;
+  private IntegerInput maxAttempts;
+  private IntegerInput callDeadlineMs;
   private LabelInput statusLabel;
   private Button testBtn;
   private Button fetchBtn;
@@ -115,6 +117,8 @@ public class SettingsView implements Extension
     verifySsl = new CheckboxInput(HikvisionSettings.getVerifySsl());
     zusatzfeldName = new TextInput(HikvisionSettings.getZusatzfeldName(), 64);
     interCallPauseMs = new IntegerInput(HikvisionSettings.getInterCallPauseMs());
+    maxAttempts = new IntegerInput(HikvisionSettings.getMaxAttempts());
+    callDeadlineMs = new IntegerInput(HikvisionSettings.getCallDeadlineMs());
 
     tab.addLabelPair("Controller-URL", url);
     tab.addLabelPair("Benutzer", user);
@@ -150,6 +154,8 @@ public class SettingsView implements Extension
 
     tab.addLabelPair("Zusatzfeld-Name (transponder)", zusatzfeldName);
     tab.addLabelPair("Pause zwischen Calls (ms)", interCallPauseMs);
+    tab.addLabelPair("Versuche pro Call (1 = ohne Wiederholung)", maxAttempts);
+    tab.addLabelPair("Max. Dauer pro Call (ms, danach Timeout + Wiederholung)", callDeadlineMs);
 
     Composite btnRow = new Composite(tab.getComposite(), SWT.NONE);
     btnRow.setLayoutData(new GridData(SWT.FILL, SWT.CENTER, true, false, 2, 1));
@@ -343,16 +349,24 @@ public class SettingsView implements Extension
     HikvisionSettings.setVerifySsl(Boolean.TRUE.equals(verifySsl.getValue()));
     Object pause = interCallPauseMs.getValue();
     if (pause instanceof Integer) HikvisionSettings.setInterCallPauseMs((Integer) pause);
+    Object attempts = maxAttempts.getValue();
+    if (attempts instanceof Integer) HikvisionSettings.setMaxAttempts((Integer) attempts);
+    Object deadline = callDeadlineMs.getValue();
+    if (deadline instanceof Integer) HikvisionSettings.setCallDeadlineMs((Integer) deadline);
   }
 
   private HikvisionClient currentClient()
   {
-    return new HikvisionClient(
+    HikvisionClient client = new HikvisionClient(
         HikvisionSettings.getControllerUrl(),
         HikvisionSettings.getControllerUser(),
         HikvisionSettings.getControllerPassword(),
         HikvisionSettings.getInterCallPauseMs(),
         HikvisionSettings.getVerifySsl());
+    // No cancel button here, but the configured deadline still bounds a
+    // wedged test/fetch call so it can't hang indefinitely.
+    client.setResilience(HikvisionSettings.getMaxAttempts(), HikvisionSettings.getCallDeadlineMs());
+    return client;
   }
 
   private static String xtract(String xml, String tag)

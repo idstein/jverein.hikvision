@@ -119,6 +119,12 @@ public class SyncEngine
     public Status status;
     public String detail = "";
     public String jvereinName = "";
+    /** Derived: controller is actively blocking this user on an expired
+     *  validity window (enable=true + endTime in the past) — typically a
+     *  departed member kept on the controller for swipe-history. Recomputed
+     *  from current* via {@link #computeAccessEnded}; not part of the sync
+     *  action {@link #status}. */
+    public boolean accessEnded = false;
   }
 
   public static class Plan
@@ -474,6 +480,7 @@ public class SyncEngine
         + " hik-only=" + plan.hikOnly
         + " | übersprungen=" + plan.membersSkipped + " unbekannte Transponder=" + plan.unknownCards);
 
+    for (PlanRow r : plan.rows) r.accessEnded = computeAccessEnded(r);
     PlanCache.save(plan);
     // The authoritative group catalog was already fetched + saved by
     // loadGroupCatalog() above — no plan-derived overwrite needed.
@@ -697,6 +704,7 @@ public class SyncEngine
         + " unvollständig=" + merged.incomplete + " hik-only=" + merged.hikOnly
         + " | unbekannte Transponder (Scope)=" + merged.unknownCards);
 
+    for (PlanRow r : merged.rows) r.accessEnded = computeAccessEnded(r);
     PlanCache.save(merged);
     return merged;
   }
@@ -963,6 +971,10 @@ public class SyncEngine
         HikvisionSettings.getControllerUrl(), HikvisionSettings.getControllerUser(),
         HikvisionSettings.getControllerPassword(), HikvisionSettings.getInterCallPauseMs(),
         HikvisionSettings.getVerifySsl());
+    // Make every controller call honour the cancel button and the configured
+    // retry/deadline knobs, so a wedged call can't hang the task slot.
+    client.setCancelCheck(pl::isCancelled);
+    client.setResilience(HikvisionSettings.getMaxAttempts(), HikvisionSettings.getCallDeadlineMs());
 
     Plan plan = computePlan(chips, client, pl);
     int total = plan.rows.size();
@@ -1014,10 +1026,82 @@ public class SyncEngine
         + " regionsChanged=" + r.regionsChanged
         + " validChanged=" + r.validChanged + " errors=" + r.errors.size());
 
-    if (!dryRun && (r.created + r.deleted + r.cardsAdded + r.cardsRemoved + r.disabled
-                    + r.reactivated + r.groupsChanged + r.regionsChanged + r.validChanged) > 0)
-      PlanCache.invalidate();
+    int changes = r.created + r.deleted + r.cardsAdded + r.cardsRemoved + r.disabled
+                + r.reactivated + r.groupsChanged + r.regionsChanged + r.validChanged;
+    if (!dryRun && changes > 0)
+    {
+      if (r.errors.isEmpty())
+        // Apply succeeded fully — fold the applied changes into the plan so the
+        // cached Benutzer view reflects the new controller state immediately and
+        // survives a restart, WITHOUT a follow-up full re-fetch.
+        foldAppliedIntoCache(plan);
+      else
+        // Partial failure — real controller state is uncertain, so drop the
+        // cache and let the next view-open / refresh re-fetch authoritatively.
+        PlanCache.invalidate();
+    }
     return r;
+  }
+
+  /** After a fully-successful apply, rewrite each actionable row's "current"
+   *  side to equal what we just pushed (so it now reads as in-sync), drop
+   *  DELETE rows, recompute the access-ended flag + counters, and persist. No
+   *  controller round-trip — this is the cheap alternative to invalidating the
+   *  cache and forcing a manual Aktualisieren after every sync. */
+  private static void foldAppliedIntoCache(Plan plan)
+  {
+    java.util.Iterator<PlanRow> it = plan.rows.iterator();
+    while (it.hasNext())
+    {
+      PlanRow r = it.next();
+      if (r.status == null) continue;
+      switch (r.status)
+      {
+        case DELETE:
+          it.remove();                 // user removed from the controller
+          break;
+        case CREATE:
+        case UPDATE:
+        case DISABLE:
+        case REACTIVATE:
+          foldDesiredIntoCurrent(r);   // current := desired (now applied)
+          r.status = Status.OK;
+          r.detail = "in sync";
+          break;
+        default:                       // OK / HIK_ONLY / INCOMPLETE — untouched
+          break;
+      }
+      r.accessEnded = computeAccessEnded(r);
+    }
+    recount(plan);
+    PlanCache.save(plan);
+  }
+
+  /** Mirror a successfully-applied row's desired state onto its current state.
+   *  Mirrors exactly what the apply* methods write: cards, managed region
+   *  groups, a changed org group, and the Valid enable/endTime pair. */
+  private static void foldDesiredIntoCurrent(PlanRow r)
+  {
+    r.currentCards = new ArrayList<>(r.desiredCards);
+    if (r.desiredRegionIds != null && !r.desiredRegionIds.isEmpty())
+      r.currentRegionIds = new ArrayList<>(r.desiredRegionIds);
+    if (r.desiredGroupId != null && !r.desiredGroupId.isEmpty())
+    { r.groupId = r.desiredGroupId; r.groupName = r.desiredGroupName; }
+    r.currentEnabled  = r.desiredEnabled;
+    r.currentValidEnd = r.desiredValidEnd;
+  }
+
+  /** True when the controller is actively denying this user purely on an
+   *  expired validity window: {@code Valid.enable=true} (time restriction ON)
+   *  with a real (non-far-future) {@code endTime} now in the past. This is the
+   *  state a member lands in once their Austrittsdatum passes — they are kept
+   *  on the controller (not deleted) so swipe history stays attached to their
+   *  transponder, but their access has ended. enable=false means "no
+   *  restriction" (always allow) → never counts as ended. */
+  public static boolean computeAccessEnded(PlanRow r)
+  {
+    return r != null && r.currentEnabled && r.currentValidEnd != null
+        && r.currentValidEnd.before(new Date());
   }
 
   private static void applyCreate(HikvisionClient c, PlanRow row, boolean dry, Result r,

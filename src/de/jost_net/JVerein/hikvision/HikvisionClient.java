@@ -6,6 +6,7 @@ import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
+import java.net.http.HttpTimeoutException;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.security.SecureRandom;
@@ -16,6 +17,11 @@ import java.util.Collection;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
+import java.util.function.BooleanSupplier;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -88,14 +94,57 @@ public class HikvisionClient
     this.http = b.build();
   }
 
+  // ---------------------------------------------------------- Cancellation
+
+  /** Optional cancellation hook. The sync / refresh code wires this to the
+   *  Jameica background task's interrupt flag so a wedged controller call
+   *  can be abandoned promptly. Without it, a single hung {@code send()}
+   *  blocks Jameica's one-at-a-time background-task slot indefinitely —
+   *  observed in the field: a UserInfo/Search call stopped logging at
+   *  pos=300 and never returned, after which neither the cancel button nor
+   *  any later sync / refresh could run ("there's already running a
+   *  background task"). Default never-cancelled so callers that don't set
+   *  it keep working. */
+  private volatile BooleanSupplier cancelCheck = () -> false;
+
+  public void setCancelCheck(BooleanSupplier c) { this.cancelCheck = (c == null) ? () -> false : c; }
+
+  private boolean cancelled()
+  {
+    try { return cancelCheck.getAsBoolean(); }
+    catch (Exception e) { return false; }
+  }
+
   // ---------------------------------------------------------------- HTTP
 
-  /** Max attempts per request. The controller intermittently rejects a valid
-   *  digest with a 401 {@code <userCheck>} (single-use nonce / session-pool
-   *  contention under sustained load) or drops the connection. A single such
-   *  hiccup must NOT abort a ~60-call full refresh, so we re-do the full
-   *  challenge-response with a fresh nonce a few times before giving up. */
-  private static final int MAX_ATTEMPTS = 4;
+  /** Default max attempts per request. The controller intermittently rejects
+   *  a valid digest with a 401 {@code <userCheck>} (single-use nonce /
+   *  session-pool contention under sustained load) or drops the connection.
+   *  A single such hiccup must NOT abort a ~60-call full refresh, so we re-do
+   *  the full challenge-response with a fresh nonce a few times before giving
+   *  up. Overridable via {@link #setResilience} (controller settings). */
+  private static final int DEFAULT_MAX_ATTEMPTS = 4;
+
+  /** Default absolute ceiling (ms) for a single round-trip, enforced by our
+   *  own polling loop in {@link #send} independently of the JDK HttpClient
+   *  request timeout — which has been observed NOT to fire on this controller
+   *  (a call once wedged for hours). A little above the per-request
+   *  {@link #send} timeout (20s) so the JDK timeout normally wins and we only
+   *  step in when it misbehaves; on expiry we throw {@link HttpTimeoutException}
+   *  so the normal (limited) retry/backoff path runs. Overridable via
+   *  {@link #setResilience}. */
+  private static final long DEFAULT_CALL_DEADLINE_MS = 30_000;
+
+  private volatile int  maxAttempts    = DEFAULT_MAX_ATTEMPTS;
+  private volatile long callDeadlineMs = DEFAULT_CALL_DEADLINE_MS;
+
+  /** Override the resilience knobs from settings. {@code maxAttempts} is
+   *  clamped to ≥1 (1 = try once, no retry); {@code callDeadlineMs} to ≥1000. */
+  public void setResilience(int maxAttempts, long callDeadlineMs)
+  {
+    this.maxAttempts    = Math.max(1, maxAttempts);
+    this.callDeadlineMs = Math.max(1000L, callDeadlineMs);
+  }
 
   /** One logical round-trip with fresh digest, retried on transient 401 /
    *  connection failures. Throws on a genuine non-2xx (other than a retried
@@ -104,7 +153,7 @@ public class HikvisionClient
   {
     String url = baseUrl + path;
     IOException last = null;
-    for (int attempt = 1; attempt <= MAX_ATTEMPTS; attempt++)
+    for (int attempt = 1; attempt <= maxAttempts; attempt++)
     {
       HttpResponse<String> r1;
       try { r1 = send(method, url, body, null); }
@@ -140,7 +189,7 @@ public class HikvisionClient
       throw new IOException("HTTP " + code + " on " + method + " " + path + ": " + r2.body());
     }
     throw last != null ? last
-        : new IOException("Hikvision-Request fehlgeschlagen nach " + MAX_ATTEMPTS + " Versuchen: " + method + " " + path);
+        : new IOException("Hikvision-Request fehlgeschlagen nach " + maxAttempts + " Versuchen: " + method + " " + path);
   }
 
   /** Log + pause before the next attempt. Returns false when no attempts are
@@ -148,12 +197,26 @@ public class HikvisionClient
    *  the controller's session pool recover. */
   private boolean backoff(int attempt, String method, String path, IOException cause) throws InterruptedIOException
   {
-    if (attempt >= MAX_ATTEMPTS) return false;
-    Logger.warn("Hikvision-Wiederholung " + (attempt + 1) + "/" + MAX_ATTEMPTS + " für " + method + " " + path
+    if (attempt >= maxAttempts) return false;
+    Logger.warn("Hikvision-Wiederholung " + (attempt + 1) + "/" + maxAttempts + " für " + method + " " + path
         + " nach: " + cause.getClass().getSimpleName() + ": " + cause.getMessage());
-    try { Thread.sleep(Math.max(pauseMs, 1500)); }
-    catch (InterruptedException e) { Thread.currentThread().interrupt(); throw new InterruptedIOException(e.getMessage()); }
+    sleepCancelable(Math.max(pauseMs, 1500));
     return true;
+  }
+
+  /** Cancel-aware sleep: wakes in short slices and throws on cancel, so an
+   *  inter-call pause or retry backoff never delays an abort. */
+  private void sleepCancelable(long ms) throws InterruptedIOException
+  {
+    long endNanos = System.nanoTime() + ms * 1_000_000L;
+    while (true)
+    {
+      if (cancelled()) throw new InterruptedIOException("Abgebrochen");
+      long remNanos = endNanos - System.nanoTime();
+      if (remNanos <= 0) return;
+      try { Thread.sleep(Math.min(200L, remNanos / 1_000_000L + 1)); }
+      catch (InterruptedException e) { Thread.currentThread().interrupt(); throw new InterruptedIOException(e.getMessage()); }
+    }
   }
 
   private HttpResponse<String> send(String method, String url, String body, String authHeader) throws IOException
@@ -173,8 +236,45 @@ public class HikvisionClient
       case "DELETE": b.DELETE();     break;
       default:       b.method(method, bp);
     }
-    try { return http.send(b.build(), HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8)); }
-    catch (InterruptedException e) { Thread.currentThread().interrupt(); throw new InterruptedIOException(e.getMessage()); }
+    // Async send + bounded polling instead of the synchronous http.send():
+    //  - we ABANDON the wait on cancel or on our own hard deadline (throw),
+    //    without needing the wedged exchange to actually unblock — the
+    //    orphaned future is cancelled and left to expire on its own;
+    //  - cancellation throws InterruptedIOException (never retried);
+    //  - the hard deadline throws HttpTimeoutException so request()'s
+    //    limited retry/backoff path handles it like any other timeout.
+    // This is what stops a single hung call from holding Jameica's
+    // one-at-a-time background-task slot forever.
+    CompletableFuture<HttpResponse<String>> f =
+        http.sendAsync(b.build(), HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
+    long deadlineNanos = System.nanoTime() + callDeadlineMs * 1_000_000L;
+    try
+    {
+      while (true)
+      {
+        if (cancelled()) { f.cancel(true); throw new InterruptedIOException("Abgebrochen"); }
+        try { return f.get(250, TimeUnit.MILLISECONDS); }
+        catch (TimeoutException te)
+        {
+          if (System.nanoTime() >= deadlineNanos)
+          {
+            f.cancel(true);
+            throw new HttpTimeoutException("Controller-Aufruf überschritt " + callDeadlineMs
+                + "ms: " + method + " " + url);
+          }
+        }
+      }
+    }
+    catch (InterruptedException ie)
+    { f.cancel(true); Thread.currentThread().interrupt(); throw new InterruptedIOException(ie.getMessage()); }
+    catch (ExecutionException ee)
+    {
+      f.cancel(true);
+      Throwable c = ee.getCause();
+      if (c instanceof InterruptedIOException) throw (InterruptedIOException) c;
+      if (c instanceof IOException)             throw (IOException) c;
+      throw new IOException(c == null ? ee.toString() : c.toString(), c);
+    }
   }
 
   // ---------------------------------------------------------- Digest auth
@@ -241,7 +341,7 @@ public class HikvisionClient
 
   // ----------------------------------------------------- ISAPI operations
 
-  private void pace() { try { Thread.sleep(pauseMs); } catch (InterruptedException e) { Thread.currentThread().interrupt(); } }
+  private void pace() throws InterruptedIOException { sleepCancelable(pauseMs); }
 
   private JSONObject postJson(String path, JSONObject body) throws IOException
   {

@@ -80,6 +80,26 @@ public class HikvisionSettings
   }
   public static void setInterCallPauseMs(int n) { SETTINGS.setAttribute("controller.interCallPauseMs", n); }
 
+  // -- resilience (retry + per-call deadline) --
+  /** Max attempts per controller round-trip. 1 = try once, no retry. A
+   *  transient 401 / dropped connection / timeout is retried up to this many
+   *  times (with a backoff) before the call fails. Clamped to ≥1. */
+  public static int getMaxAttempts()
+  {
+    return Math.max(1, SETTINGS.getInt("controller.maxAttempts", 4));
+  }
+  public static void setMaxAttempts(int n) { SETTINGS.setAttribute("controller.maxAttempts", Math.max(1, n)); }
+
+  /** Hard ceiling (ms) for a single controller round-trip, enforced
+   *  independently of the JDK request timeout so a wedged call can't hang the
+   *  background-task slot forever. On expiry the call times out and is
+   *  retried (subject to {@link #getMaxAttempts}). Clamped to ≥1000. */
+  public static int getCallDeadlineMs()
+  {
+    return Math.max(1000, SETTINGS.getInt("controller.callDeadlineMs", 30000));
+  }
+  public static void setCallDeadlineMs(int n) { SETTINGS.setAttribute("controller.callDeadlineMs", Math.max(1000, n)); }
+
   // -- safety --
   public static boolean getDryRun()
   {

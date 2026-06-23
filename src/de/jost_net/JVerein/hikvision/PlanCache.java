@@ -151,6 +151,7 @@ public final class PlanCache
         if (cve > 0) r.currentValidEnd = new java.util.Date(cve);
         long dve = o.optLong("desiredValidEnd", 0);
         if (dve > 0) r.desiredValidEnd = new java.util.Date(dve);
+        r.accessEnded = SyncEngine.computeAccessEnded(r);   // derived from current* — recompute as-of-now
         c.plan.rows.add(r);
       }
       return c;
