@@ -67,6 +67,7 @@ public class SyncEngine
     public int deleted;
     public int cardsAdded;
     public int cardsRemoved;
+    public int cardsMoved;         // cards reclaimed from a donor not in this plan, then re-attached
     public int groupsChanged;      // org userGroup (userGroupNodeID) moves
     public int regionsChanged;     // Berechtigungsgruppen (regionPermissionGroupIDList) changes
     public int validChanged;
@@ -1103,21 +1104,21 @@ public class SyncEngine
       switch (row.status)
       {
         case CREATE:
-          applyCreate(client, row, dryRun, r, pl);
+          applyCreate(client, plan, row, dryRun, r, pl);
           break;
 
         case UPDATE:
-          applyUpdate(client, row, dryRun, r, pl);   // card adds + group/region (removals done in pass 1)
+          applyUpdate(client, plan, row, dryRun, r, pl);   // card adds + group/region (removals done in pass 1)
           break;
 
         case DISABLE:
           applyDisable(client, row, dryRun, r, pl);
-          applyUpdate(client, row, dryRun, r, pl);   // card adds / group changes still propagate
+          applyUpdate(client, plan, row, dryRun, r, pl);   // card adds / group changes still propagate
           break;
 
         case REACTIVATE:
           applyReactivate(client, row, dryRun, r, pl);
-          applyUpdate(client, row, dryRun, r, pl);
+          applyUpdate(client, plan, row, dryRun, r, pl);
           break;
 
         case OK:
@@ -1132,8 +1133,8 @@ public class SyncEngine
     pl.log("=== DONE === created=" + r.created + " updated=" + r.updated
         + " disabled=" + r.disabled + " reactivated=" + r.reactivated
         + " deleted=" + r.deleted + " cardsAdded=" + r.cardsAdded
-        + " cardsRemoved=" + r.cardsRemoved + " groupsChanged=" + r.groupsChanged
-        + " regionsChanged=" + r.regionsChanged
+        + " cardsRemoved=" + r.cardsRemoved + " cardsMoved=" + r.cardsMoved
+        + " groupsChanged=" + r.groupsChanged + " regionsChanged=" + r.regionsChanged
         + " validChanged=" + r.validChanged + " errors=" + r.errors.size());
 
     int changes = r.created + r.deleted + r.cardsAdded + r.cardsRemoved + r.disabled
@@ -1214,7 +1215,73 @@ public class SyncEngine
         && r.currentValidEnd.before(new Date());
   }
 
-  private static void applyCreate(HikvisionClient c, PlanRow row, boolean dry, Result r,
+  /** Attach {@code cardNo} to {@code employeeNo}, recovering from the
+   *  "card already assigned to another user" case — a transponder move whose
+   *  donor wasn't in this plan (e.g. an incremental sync where only the new
+   *  holder is in scope). The global PASS 1 frees in-plan donors before any
+   *  add; this is the fallback for donors PASS 1 never saw:
+   *  <ol>
+   *    <li>optimistic createCard — succeeds outright when the card is free;</li>
+   *    <li>on failure, look up the card's current owner on the controller —
+   *        if it is already this user, treat as done;</li>
+   *    <li>otherwise detach the card (frees it from the donor) and retry the
+   *        create;</li>
+   *    <li>drop the card from the donor's row in the cached plan so it isn't
+   *        double-listed.</li>
+   *  </ol>
+   *  In the happy path this is a single call; recovery only adds round-trips
+   *  when a card genuinely has to be reclaimed. */
+  private static void attachCardMoveAware(HikvisionClient c, Plan plan, String employeeNo, String cardNo,
+                                          Result r, de.jost_net.JVerein.hikvision.ProgressListener pl) throws Exception
+  {
+    // (2) add card — succeeds immediately when the cardNo is free
+    if (c.createCard(employeeNo, cardNo)) { r.cardsAdded++; return; }
+
+    // (1) the add failed — find who currently holds the card
+    String owner = null;
+    try { owner = c.findCardOwner(cardNo); }
+    catch (Exception e) { pl.log("WARN: Karteninhaber-Abfrage für " + cardNo + " fehlgeschlagen: " + e.getMessage()); }
+
+    if (owner != null && Identity.canonical(owner).equals(Identity.canonical(employeeNo)))
+    { pl.log("Karte " + cardNo + " ist bereits " + employeeNo + " zugeordnet — übersprungen"); return; }
+
+    pl.log("Karte " + cardNo + " bereits vergeben"
+        + (owner != null ? " an " + owner : "") + " — Umzug nach " + employeeNo);
+
+    // (3) remove it from the previous user (deleteCard frees by cardNo alone)
+    if (!c.deleteCard(cardNo)) { r.errors.add("deleteCard(Umzug) " + cardNo + " fehlgeschlagen"); return; }
+    r.cardsRemoved++;
+
+    // (4) reflect the detach in the cached plan
+    detachCardFromCache(plan, cardNo, owner);
+
+    // (2, retry) now the card is free → attach to the intended user
+    if (c.createCard(employeeNo, cardNo)) { r.cardsAdded++; r.cardsMoved++; }
+    else r.errors.add("createCard(Umzug-Retry) " + employeeNo + "/" + cardNo + " fehlgeschlagen");
+  }
+
+  /** Drop {@code cardNo} from its previous holder's current cards in the cached
+   *  plan after a controller-side move, so the cache no longer double-lists it.
+   *  {@code ownerEmp} is the donor employeeNo when the owner lookup found it;
+   *  null → scan every row. The donor row keeps its status (the next refresh
+   *  reconciles it) — this only keeps the displayed/persisted cache honest. */
+  private static void detachCardFromCache(Plan plan, String cardNo, String ownerEmp)
+  {
+    if (plan == null || cardNo == null) return;
+    String canonOwner = ownerEmp == null ? null : Identity.canonical(ownerEmp);
+    for (PlanRow row : plan.rows)
+    {
+      if (row.currentCards == null || row.currentCards.isEmpty()) continue;
+      if (canonOwner != null && !canonOwner.equals(Identity.canonical(row.employeeNo))) continue;
+      if (row.currentCards.remove(cardNo))
+      {
+        row.accessEnded = computeAccessEnded(row);
+        if (canonOwner != null) break;   // found the specific donor
+      }
+    }
+  }
+
+  private static void applyCreate(HikvisionClient c, Plan plan, PlanRow row, boolean dry, Result r,
                                   de.jost_net.JVerein.hikvision.ProgressListener pl) throws Exception
   {
     // Org userGroup is automatic: sponsors → BSV, members → Mitglieder. Keep
@@ -1246,10 +1313,7 @@ public class SyncEngine
     r.created++;
     if (!row.desiredRegionIds.isEmpty()) r.regionsChanged++;
     for (String cn : row.desiredCards)
-    {
-      if (c.createCard(row.employeeNo, cn)) r.cardsAdded++;
-      else r.errors.add("createCard " + row.employeeNo + "/" + cn + " failed");
-    }
+      attachCardMoveAware(c, plan, row.employeeNo, cn, r, pl);
   }
 
   /** PASS 1 — detach every card the controller still has but the member no
@@ -1271,7 +1335,7 @@ public class SyncEngine
    *  Card removals already ran in {@link #applyCardRemovals} (pass 1), so a
    *  card moved away from another member is already free by the time we
    *  createCard it here. */
-  private static void applyUpdate(HikvisionClient c, PlanRow row, boolean dry, Result r,
+  private static void applyUpdate(HikvisionClient c, Plan plan, PlanRow row, boolean dry, Result r,
                                   de.jost_net.JVerein.hikvision.ProgressListener pl) throws Exception
   {
     Set<String> add = new HashSet<>(row.desiredCards); add.removeAll(row.currentCards);
@@ -1292,7 +1356,7 @@ public class SyncEngine
     if (dry) return;
 
     for (String cn : add)
-    { if (c.createCard(row.employeeNo, cn)) r.cardsAdded++; else r.errors.add("createCard " + row.employeeNo + "/" + cn + " failed"); }
+      attachCardMoveAware(c, plan, row.employeeNo, cn, r, pl);
 
     if (groupDiffers)
     {

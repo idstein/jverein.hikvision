@@ -564,6 +564,32 @@ public class HikvisionClient
     return out;
   }
 
+  /** Find the employeeNo a card is currently assigned to, or null if the card
+   *  isn't on the controller. Used by the sync to recover from a transponder
+   *  move whose donor wasn't in the plan: the optimistic createCard then fails
+   *  because the card is still attached elsewhere, and we need the donor to
+   *  free the card and to fix the cache. Filters CardInfo/Search by cardNo. */
+  public String findCardOwner(String cardNo) throws IOException
+  {
+    if (cardNo == null || cardNo.isEmpty()) return null;
+    JSONObject body = new JSONObject().put("CardInfoSearchCond",
+        new JSONObject().put("searchID", "j-owner")
+                        .put("searchResultPosition", 0)
+                        .put("maxResults", 1)
+                        .put("CardNoList", new JSONArray().put(new JSONObject().put("cardNo", cardNo))));
+    JSONObject res = postJson("/ISAPI/AccessControl/CardInfo/Search", body);
+    JSONObject inner = res.optJSONObject("CardInfoSearch");
+    if (inner == null) return null;
+    JSONArray items = inner.optJSONArray("CardInfo");
+    if (items == null || items.length() == 0) return null;
+    JSONObject card0 = items.getJSONObject(0);
+    // Guard a controller that ignores the CardNoList filter and returns an
+    // arbitrary first card — only trust an exact cardNo match.
+    if (!cardNo.equals(card0.optString("cardNo"))) return null;
+    String emp = card0.optString("employeeNo", "");
+    return emp.isEmpty() ? null : emp;
+  }
+
   /** Cheap O(1) probe: returns the controller's totalMatches for UserInfo
    *  without pulling any records. Used to detect drift before deciding
    *  between incremental and full refresh. */
