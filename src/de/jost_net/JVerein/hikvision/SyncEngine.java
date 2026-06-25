@@ -181,30 +181,39 @@ public class SyncEngine
     return ISO_D.format(a).equals(ISO_D.format(b));
   }
 
-  /** Load the group catalog (org userGroups + door region-permission
-   *  groups), preferring the authoritative live lists from the controller
-   *  and falling back to the persisted cache if the fetch fails. Saves the
-   *  live result so the Settings / Gruppen / Berechtigungsgruppen views
-   *  stay fresh. */
-  private static HikvisionGroupCatalog loadGroupCatalog(HikvisionClient client,
-      de.jost_net.JVerein.hikvision.ProgressListener pl)
+  /** Seed the name→UUID map with the configured member / sponsor default
+   *  groups so they resolve even on a brand-new install whose catalog cache is
+   *  still empty (the two groups always have a UUID in the Einstellungen). */
+  private static void seedSettingsGroups(Map<String, String> uuidByGroupName)
   {
-    try
-    {
-      JSONArray ug = client.listUserGroups();
-      JSONArray rg = client.listRegionPermissionGroups();
-      HikvisionGroupCatalog cat = HikvisionGroupCatalog.fromControllerLists(ug, rg, System.currentTimeMillis());
-      HikvisionGroupCatalog.save(cat);
-      pl.log("Hikvision Gruppen: " + cat.groups.size() + " Organisationsgruppen, "
-          + cat.regions.size() + " Berechtigungsgruppen geladen");
-      return cat;
-    }
-    catch (Exception e)
-    {
-      pl.log("WARN: Gruppen konnten nicht vom Controller geladen werden ("
-          + e.getClass().getSimpleName() + ": " + e.getMessage() + ") — nutze Cache");
-      return HikvisionGroupCatalog.fromCache();
-    }
+    putIfBoth(uuidByGroupName, HikvisionSettings.getMemberGroupName(),  HikvisionSettings.getMemberGroupId());
+    putIfBoth(uuidByGroupName, HikvisionSettings.getSponsorGroupName(), HikvisionSettings.getSponsorGroupId());
+  }
+
+  private static void putIfBoth(Map<String, String> m, String name, String uuid)
+  {
+    if (name != null && !name.isEmpty() && uuid != null && !uuid.isEmpty()) m.putIfAbsent(name, uuid);
+  }
+
+  /** True when an org group we might need to assign a member <i>to</i> can't be
+   *  resolved to a UUID yet: the configured member-default / sponsor groups, or
+   *  a managed assignment's chosen group. A member's <i>current</i> group always
+   *  resolves from the live UserInfo, so it isn't checked here. Only an empty
+   *  target group — one that never appears on any live user and isn't cached —
+   *  trips this, which is when we fetch the org-group list on the fly. */
+  private static boolean anyAutoTargetGroupUnresolved(MitgliedAssignments asn,
+      Map<String, String> uuidByGroupName)
+  {
+    if (groupUnresolved(HikvisionSettings.getMemberGroupName(),  uuidByGroupName)) return true;
+    if (groupUnresolved(HikvisionSettings.getSponsorGroupName(), uuidByGroupName)) return true;
+    for (MitgliedAssignments.Assignment a : asn.all())
+      if (a.groupManaged && groupUnresolved(a.hikvisionGroup, uuidByGroupName)) return true;
+    return false;
+  }
+
+  private static boolean groupUnresolved(String name, Map<String, String> uuidByGroupName)
+  {
+    return name != null && !name.isEmpty() && !uuidByGroupName.containsKey(name);
   }
 
   /** Desired org userGroup name for a row.
@@ -287,13 +296,20 @@ public class SyncEngine
     MitgliedAssignments asn = MitgliedAssignments.load();
     pl.log("MitgliedAssignments: " + asn.size() + " Zuweisungen geladen");
 
-    // Authoritative group lists straight from the controller (org userGroups
-    // + door Berechtigungsgruppen), so groups with no current members are
-    // still resolvable.
-    HikvisionGroupCatalog cat = loadGroupCatalog(client, pl);
+    // Groups + Berechtigungsgruppen come from the local catalog CACHE — not a
+    // controller fetch. The org-group list is refreshed on demand in the
+    // Organisationsgruppen view, the Berechtigungsgruppen list in the
+    // Berechtigungsgruppen view (or both via the Einstellungen). The name→UUID
+    // map is augmented below from the live UserInfo records; if a needed org
+    // group still can't be resolved we fetch the group list once, on the fly.
+    HikvisionGroupCatalog cat = HikvisionGroupCatalog.fromCache();
     Map<String, String>  uuidByGroupName = uuidByGroupName(cat);
     Map<String, Integer> regionIdByName  = regionIdByName(cat);
     Map<Integer, String> regionNameById  = regionNameById(cat);
+    seedSettingsGroups(uuidByGroupName);
+    if (cat.regions.isEmpty())
+      pl.log("Hinweis: Berechtigungsgruppen-Cache leer — in der Berechtigungsgruppen-Sicht "
+          + "'Aktualisieren' klicken, falls Türrechte zugewiesen werden sollen.");
 
     // Index jverein members
     Map<String, Mitglied> jvByExterne = new HashMap<>();
@@ -360,31 +376,65 @@ public class SyncEngine
       desired.put(id.employeeNo, row);
     }
 
-    // Pull Hikvision actual state
+    // Pull Hikvision actual state. Users FIRST — each UserInfo carries its org
+    // group inline (userGroupNodeID / userGroupNodeName), so we resolve group
+    // names → UUIDs from the live users rather than a separate group fetch.
     pl.log("Hikvision UserInfo abrufen…");
     JSONArray users = client.listAllUsers(pl);
-    pl.log("Hikvision CardInfo abrufen…");
-    JSONArray cards = client.listAllCards(pl);
     plan.userTotal = users.length();
-    plan.cardTotal = cards.length();
 
-    // Index Hikvision data by *canonical* employeeNo so leading-zero
-    // variants (e.g. "0497") match jverein-derived ids ("497"). The
-    // original literal employeeNo is preserved in the UserInfo JSON for
-    // any write operations.
+    // Index users by *canonical* employeeNo so leading-zero variants
+    // (e.g. "0497") match jverein-derived ids ("497"); the literal employeeNo
+    // stays in the UserInfo JSON for write operations. Augment the name→UUID
+    // map from each user's inline group so any member-bearing group resolves.
+    Map<String, JSONObject> actualByEmp = new TreeMap<>();
+    for (int i = 0; i < users.length(); i++)
+    {
+      JSONObject u = users.getJSONObject(i);
+      actualByEmp.put(Identity.canonical(u.optString("employeeNo")), u);
+      String gid = u.optString("userGroupNodeID", "");
+      String gnm = u.optString("userGroupNodeName", "");
+      if (!gid.isEmpty() && !gnm.isEmpty()) uuidByGroupName.putIfAbsent(gnm, gid);
+    }
+
+    // Only if a group we actually need to assign someone TO (member default,
+    // sponsor group, or a managed stored group) still isn't resolvable — i.e.
+    // an empty group that never appears on a live user and isn't cached — do we
+    // fetch the org-group list, once.
+    if (anyAutoTargetGroupUnresolved(asn, uuidByGroupName))
+    {
+      pl.log("Unbekannte Organisationsgruppe — lade Gruppenliste vom Controller…");
+      HikvisionGroupCatalog fresh = HikvisionGroupCatalog.refreshFromHikvision(client, pl, true, false);
+      uuidByGroupName = uuidByGroupName(fresh);
+      seedSettingsGroups(uuidByGroupName);
+      for (JSONObject u : actualByEmp.values())
+      {
+        String gid = u.optString("userGroupNodeID", "");
+        String gnm = u.optString("userGroupNodeName", "");
+        if (!gid.isEmpty() && !gnm.isEmpty()) uuidByGroupName.putIfAbsent(gnm, gid);
+      }
+    }
+
+    // Cards: fetch ONLY for managed users (scoped by employeeNo). Unmanaged
+    // entries (SKM* …) are never synced, so their cards aren't part of the
+    // diff. Use the literal controller employeeNo so leading-zero forms match.
+    List<String> managedEmps = new ArrayList<>();
+    for (Map.Entry<String, JSONObject> e : actualByEmp.entrySet())
+      if (Identity.isManaged(e.getKey())) managedEmps.add(e.getValue().optString("employeeNo"));
+    pl.log("Hikvision CardInfo abrufen (nur " + managedEmps.size() + " verwaltete Benutzer)…");
+    JSONArray cards = client.listCards(managedEmps, pl);
+    // cardTotal must reflect the controller's TRUE total (cheap O(1) probe), not
+    // the scoped count — the incremental refresh's drift check compares it
+    // against client.getTotalCards() and would otherwise always escalate.
+    try { plan.cardTotal = client.getTotalCards(); }
+    catch (Exception ex) { plan.cardTotal = cards.length(); }
+
     Map<String, List<String>> cardsByEmp = new HashMap<>();
     for (int i = 0; i < cards.length(); i++)
     {
       JSONObject c = cards.getJSONObject(i);
       cardsByEmp.computeIfAbsent(Identity.canonical(c.optString("employeeNo")), k -> new ArrayList<>())
                 .add(c.optString("cardNo"));
-    }
-
-    Map<String, JSONObject> actualByEmp = new TreeMap<>();
-    for (int i = 0; i < users.length(); i++)
-    {
-      JSONObject u = users.getJSONObject(i);
-      actualByEmp.put(Identity.canonical(u.optString("employeeNo")), u);
     }
 
     // Walk every Hikvision entry first (so the table shows everything)
@@ -482,8 +532,9 @@ public class SyncEngine
 
     for (PlanRow r : plan.rows) r.accessEnded = computeAccessEnded(r);
     PlanCache.save(plan);
-    // The authoritative group catalog was already fetched + saved by
-    // loadGroupCatalog() above — no plan-derived overwrite needed.
+    // The group catalog is owned by the Organisationsgruppen / Berechtigungs-
+    // gruppen views now — a plain refresh doesn't overwrite it (the on-the-fly
+    // org-group fallback above already saved any freshly-fetched groups).
     return plan;
   }
 
@@ -1013,32 +1064,55 @@ public class SyncEngine
     Result r = new Result();
     r.dryRun = dryRun;
     int total = plan.rows.size();
+
+    // A cardNo can belong to only one user on the controller. When a
+    // transponder moves from member A to member B, B's createCard would fail
+    // ("card already assigned") unless A's deleteCard ran first. So enforce a
+    // strict global order across the whole plan, independent of row order:
+    //   PASS 1 — detach every no-longer-desired card (and delete orphans),
+    //            freeing those cardNos;
+    //   PASS 2 — create users, attach cards, apply group / region / valid.
+    // This guarantees a moved card is always free before it's re-attached.
+    int steps = total * 2;
     int done = 0;
-    pl.progress(done, total, "Sync läuft");
+    pl.progress(done, steps, "Karten entfernen");
 
     for (PlanRow row : plan.rows)
     {
-      if (pl.isCancelled()) throw new java.io.InterruptedIOException("Abgebrochen nach " + done + "/" + total);
-
+      if (pl.isCancelled()) throw new java.io.InterruptedIOException("Abgebrochen nach " + done + "/" + steps);
       switch (row.status)
       {
-        case OK:
-        case HIK_ONLY:
-        case INCOMPLETE:
-          // no action — INCOMPLETE intentionally requires user intervention
+        case UPDATE:
+        case DISABLE:
+        case REACTIVATE:
+          applyCardRemovals(client, row, dryRun, r, pl);
           break;
+        case DELETE:
+          applyDelete(client, row, dryRun, r, pl);   // removes its cards + the user
+          break;
+        default:
+          break;
+      }
+      pl.progress(++done, steps, "Karten entfernen");
+    }
 
+    pl.progress(done, steps, "Karten & Gruppen zuweisen");
+    for (PlanRow row : plan.rows)
+    {
+      if (pl.isCancelled()) throw new java.io.InterruptedIOException("Abgebrochen nach " + done + "/" + steps);
+      switch (row.status)
+      {
         case CREATE:
           applyCreate(client, row, dryRun, r, pl);
           break;
 
         case UPDATE:
-          applyUpdate(client, row, dryRun, r, pl);
+          applyUpdate(client, row, dryRun, r, pl);   // card adds + group/region (removals done in pass 1)
           break;
 
         case DISABLE:
           applyDisable(client, row, dryRun, r, pl);
-          applyUpdate(client, row, dryRun, r, pl);   // card/group changes still propagate
+          applyUpdate(client, row, dryRun, r, pl);   // card adds / group changes still propagate
           break;
 
         case REACTIVATE:
@@ -1046,12 +1120,13 @@ public class SyncEngine
           applyUpdate(client, row, dryRun, r, pl);
           break;
 
-        case DELETE:
-          applyDelete(client, row, dryRun, r, pl);
+        case OK:
+        case HIK_ONLY:
+        case INCOMPLETE:   // intentionally requires user intervention
+        case DELETE:       // fully handled in pass 1
           break;
       }
-
-      pl.progress(++done, total, "Sync läuft");
+      pl.progress(++done, steps, "Karten & Gruppen zuweisen");
     }
 
     pl.log("=== DONE === created=" + r.created + " updated=" + r.updated
@@ -1177,19 +1252,37 @@ public class SyncEngine
     }
   }
 
+  /** PASS 1 — detach every card the controller still has but the member no
+   *  longer wants, freeing the cardNo so {@link #applyUpdate} / {@link
+   *  #applyCreate} can re-attach it to whoever now holds it. Runs for
+   *  UPDATE / DISABLE / REACTIVATE rows before any card is added anywhere. */
+  private static void applyCardRemovals(HikvisionClient c, PlanRow row, boolean dry, Result r,
+                                        de.jost_net.JVerein.hikvision.ProgressListener pl) throws Exception
+  {
+    Set<String> rem = new HashSet<>(row.currentCards); rem.removeAll(row.desiredCards);
+    if (rem.isEmpty()) return;
+    pl.log("UPDATE-cards " + row.employeeNo + " entfernen -" + rem);
+    if (dry) return;
+    for (String cn : rem)
+    { if (c.deleteCard(cn)) r.cardsRemoved++; else r.errors.add("deleteCard " + cn + " failed"); }
+  }
+
+  /** PASS 2 — attach newly-desired cards and apply group / region changes.
+   *  Card removals already ran in {@link #applyCardRemovals} (pass 1), so a
+   *  card moved away from another member is already free by the time we
+   *  createCard it here. */
   private static void applyUpdate(HikvisionClient c, PlanRow row, boolean dry, Result r,
                                   de.jost_net.JVerein.hikvision.ProgressListener pl) throws Exception
   {
     Set<String> add = new HashSet<>(row.desiredCards); add.removeAll(row.currentCards);
-    Set<String> rem = new HashSet<>(row.currentCards); rem.removeAll(row.desiredCards);
     Set<Integer> addR = new HashSet<>(row.desiredRegionIds); addR.removeAll(row.currentRegionIds);
     Set<Integer> remR = new HashSet<>(row.currentRegionIds); remR.removeAll(row.desiredRegionIds);
     boolean regionsDiffer = !addR.isEmpty() || !remR.isEmpty();
     boolean groupDiffers = row.desiredGroupId != null && !row.desiredGroupId.isEmpty()
         && !row.desiredGroupId.equals(row.groupId);
 
-    if (!add.isEmpty() || !rem.isEmpty())
-      pl.log("UPDATE-cards " + row.employeeNo + " +" + add + " -" + rem);
+    if (!add.isEmpty())
+      pl.log("UPDATE-cards " + row.employeeNo + " +" + add);
     if (groupDiffers)
       pl.log("UPDATE-Gruppe " + row.employeeNo + " " + row.groupName + " → " + row.desiredGroupName);
     if (regionsDiffer)
@@ -1198,8 +1291,6 @@ public class SyncEngine
 
     if (dry) return;
 
-    for (String cn : rem)
-    { if (c.deleteCard(cn)) r.cardsRemoved++; else r.errors.add("deleteCard " + cn + " failed"); }
     for (String cn : add)
     { if (c.createCard(row.employeeNo, cn)) r.cardsAdded++; else r.errors.add("createCard " + row.employeeNo + "/" + cn + " failed"); }
 

@@ -56,7 +56,7 @@ public class HikvisionBenutzerView extends AbstractView
   private Combo filterCombo;
   private ProgressBar progress;
   private Text logArea;
-  private Button refreshBtn, refreshVisibleBtn, syncBtn;
+  private Button refreshBtn, refreshIncrementalBtn, refreshVisibleBtn, syncBtn;
   private org.eclipse.swt.widgets.Button dryRunCheckbox;
   private Text searchField;          // live full-text search across visible columns
   private java.util.List<SyncEngine.PlanRow> currentRows = java.util.Collections.emptyList();
@@ -77,7 +77,8 @@ public class HikvisionBenutzerView extends AbstractView
     Label info = new Label(c, SWT.WRAP);
     info.setText("Diff-Übersicht: was würde 'Übertragen' (jverein → Hikvision) tun? "
         + "Filter unten links wählt die Aktion. Letzter Stand wird aus lokalem Cache geladen. "
-        + "Aktualisieren prüft den Abgleich neu; Übertragen schreibt nur die nicht-synchronen Zeilen.");
+        + "Aktualisieren (alles, ~80 s) · Inkrementell (nur offene + geänderte) · Schnelles (nur sichtbare); "
+        + "Übertragen schreibt nur die nicht-synchronen Zeilen.");
     GridData infoGd = new GridData(SWT.FILL, SWT.CENTER, true, false, 2, 1);
     infoGd.widthHint = 800;
     info.setLayoutData(infoGd);
@@ -85,14 +86,22 @@ public class HikvisionBenutzerView extends AbstractView
     // --- toolbar (refresh modes / filter / count) ---
     Composite toolbar = new Composite(c, SWT.NONE);
     toolbar.setLayoutData(new GridData(SWT.FILL, SWT.CENTER, true, false, 2, 1));
-    toolbar.setLayout(new GridLayout(5, false));
+    toolbar.setLayout(new GridLayout(6, false));
 
     refreshBtn = new Button(toolbar, SWT.PUSH);
     refreshBtn.setText("Aktualisieren");
-    refreshBtn.setToolTipText("Prüft den Abgleich mit Hikvision neu (inkrementell: nur Nicht-synchrone Zeilen "
-        + "und kürzlich geänderte Zuweisungen; holt automatisch alles, wenn Cache fehlt oder die "
-        + "Hikvision-Gesamtzahl abweicht).");
+    refreshBtn.setToolTipText("Vollständig: holt alle Benutzer und die Karten der verwalteten "
+        + "Benutzer neu vom Controller und prüft den gesamten Abgleich neu. Organisations- und "
+        + "Berechtigungsgruppen werden in deren eigenen Sichten aktualisiert.");
     refreshBtn.addSelectionListener(new SelectionAdapter() {
+      @Override public void widgetSelected(SelectionEvent e) { onRefreshFull(); }
+    });
+
+    refreshIncrementalBtn = new Button(toolbar, SWT.PUSH);
+    refreshIncrementalBtn.setText("Inkrementell");
+    refreshIncrementalBtn.setToolTipText("Inkrementell: nur Nicht-synchrone Zeilen und kürzlich geänderte "
+        + "Zuweisungen; holt automatisch alles, wenn Cache fehlt oder die Hikvision-Gesamtzahl abweicht.");
+    refreshIncrementalBtn.addSelectionListener(new SelectionAdapter() {
       @Override public void widgetSelected(SelectionEvent e) { onRefreshIncremental(); }
     });
 
@@ -598,6 +607,18 @@ public class HikvisionBenutzerView extends AbstractView
     });
   }
 
+  /** Explicit full refresh — hits all users + cards, records totals + timestamp. */
+  private void onRefreshFull()
+  {
+    final boolean dry = dryRunCheckbox.getSelection();
+    startTask("Aktualisieren (vollständig)", dry, (task, mon) -> {
+      ChipStore chips = ChipStore.defaultStore();
+      HikvisionClient client = buildClient(task);
+      MitgliedAssignments asn = MitgliedAssignments.load();
+      runFullRefresh(asn, chips, client, task, mon);
+    });
+  }
+
 
   /** Build a controller client wired to {@code task}'s cancel flag and the
    *  configured retry/deadline knobs, so every call (escalation count-probe,
@@ -806,15 +827,27 @@ public class HikvisionBenutzerView extends AbstractView
     MitgliedAssignments store = MitgliedAssignments.load();
     ChipStore chips = ChipStore.defaultStore();
 
-    boolean saved = AssignmentEditDialog.open(GUI.getShell(), store, chips,
+    java.util.Set<String> affected = AssignmentEditDialog.open(GUI.getShell(), store, chips,
         m.getID(), displayName, employeeNo, externe);
-    if (!saved) return;
+    if (affected == null) return;   // cancelled
 
+    // Recompute the edited member AND every donor that just lost a transponder
+    // (atomic move) offline — so the removal side of a move is detected too,
+    // not only the new holder. No controller call; keeps the cache intact.
     boolean updated = false;
     if (currentPlan != null)
     {
-      try { updated = SyncEngine.recomputeRowOffline(currentPlan, m, chips); }
-      catch (Exception e) { Logger.error("offline recompute failed", e); }
+      for (String jvId : affected)
+      {
+        try
+        {
+          de.jost_net.JVerein.rmi.Mitglied am = jvId.equals(m.getID()) ? m
+              : (de.jost_net.JVerein.rmi.Mitglied) de.jost_net.JVerein.Einstellungen.getDBService()
+                  .createObject(de.jost_net.JVerein.rmi.Mitglied.class, jvId);
+          if (am != null) updated |= SyncEngine.recomputeRowOffline(currentPlan, am, chips);
+        }
+        catch (Exception e) { Logger.error("offline recompute failed for jv_id=" + jvId, e); }
+      }
     }
     if (updated)
     {
@@ -956,6 +989,7 @@ public class HikvisionBenutzerView extends AbstractView
   private void setActionsEnabled(boolean en)
   {
     if (refreshBtn != null && !refreshBtn.isDisposed()) refreshBtn.setEnabled(en);
+    if (refreshIncrementalBtn != null && !refreshIncrementalBtn.isDisposed()) refreshIncrementalBtn.setEnabled(en);
     if (refreshVisibleBtn != null && !refreshVisibleBtn.isDisposed()) refreshVisibleBtn.setEnabled(en);
     if (syncBtn != null && !syncBtn.isDisposed()) syncBtn.setEnabled(en);
   }

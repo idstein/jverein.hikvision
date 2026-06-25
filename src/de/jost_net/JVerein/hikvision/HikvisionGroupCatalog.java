@@ -244,11 +244,31 @@ public class HikvisionGroupCatalog
    *  No CardInfo, no jverein DB scan, no PlanCache write. */
   public static HikvisionGroupCatalog refreshFromHikvision(HikvisionClient client, ProgressListener pl) throws IOException
   {
-    if (pl != null) pl.progress(0, 0, "Organisationsgruppen abrufen");
-    JSONArray userGroups = client.listUserGroups();
-    if (pl != null) pl.progress(0, 0, "Berechtigungsgruppen abrufen");
-    JSONArray regionGroups = client.listRegionPermissionGroups();
-    HikvisionGroupCatalog c = fromControllerLists(userGroups, regionGroups, System.currentTimeMillis());
+    return refreshFromHikvision(client, pl, true, true);
+  }
+
+  /**
+   * Refresh part (or all) of the catalog from the controller. {@code fetchUserGroups}
+   * pulls the org user groups; {@code fetchRegionGroups} pulls the door
+   * Berechtigungsgruppen. Whichever side is NOT fetched is carried over
+   * unchanged from the current cache, so the Organisationsgruppen and
+   * Berechtigungsgruppen views can each refresh their own list independently
+   * without clobbering the other. Saves the merged result.
+   */
+  public static HikvisionGroupCatalog refreshFromHikvision(HikvisionClient client, ProgressListener pl,
+      boolean fetchUserGroups, boolean fetchRegionGroups) throws IOException
+  {
+    HikvisionGroupCatalog existing = fromCache();
+    JSONArray userGroups = null, regionGroups = null;
+    if (fetchUserGroups)
+    { if (pl != null) pl.progress(0, 0, "Organisationsgruppen abrufen"); userGroups = client.listUserGroups(); }
+    if (fetchRegionGroups)
+    { if (pl != null) pl.progress(0, 0, "Berechtigungsgruppen abrufen"); regionGroups = client.listRegionPermissionGroups(); }
+    HikvisionGroupCatalog c = new HikvisionGroupCatalog(System.currentTimeMillis());
+    if (userGroups != null) addUserGroups(c, userGroups);
+    else                    c.groups.addAll(existing.groups);
+    if (regionGroups != null) addRegionPermissionGroups(c, regionGroups);
+    else                      c.regions.addAll(existing.regions);
     save(c);
     return c;
   }

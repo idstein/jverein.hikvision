@@ -62,7 +62,14 @@ public final class AssignmentEditDialog
     boolean visible;
   }
 
-  public static boolean open(Shell parent, MitgliedAssignments store, ChipStore chipStore,
+  /**
+   * Open the editor. Returns {@code null} if cancelled; otherwise the set of
+   * jverein ids whose assignment changed — always the edited member, plus any
+   * donor members a transponder was atomically moved away from. The caller
+   * recomputes a plan row for each so the <em>removal</em> side of a move is
+   * detected too, not only the new holder.
+   */
+  public static Set<String> open(Shell parent, MitgliedAssignments store, ChipStore chipStore,
                              String jvId, String displayName, String employeeNo, String externe)
   {
     Shell sh = new Shell(parent, SWT.DIALOG_TRIM | SWT.APPLICATION_MODAL | SWT.RESIZE);
@@ -223,6 +230,9 @@ public final class AssignmentEditDialog
     cancelBtn.setLayoutData(new GridData(SWT.FILL, SWT.CENTER, true, false));
 
     final boolean[] saved = { false };
+    // jverein ids touched by this save: the edited member + every donor a
+    // transponder was moved away from (so the caller can recompute both sides).
+    final Set<String> affected = new java.util.LinkedHashSet<>();
     okBtn.addSelectionListener(new SelectionAdapter() {
       @Override public void widgetSelected(SelectionEvent e)
       {
@@ -312,6 +322,8 @@ public final class AssignmentEditDialog
               "Zuweisung wurde in MitgliedAssignments gespeichert, aber Rückschreiben in jverein lieferte: "
               + ex.getClass().getSimpleName() + ": " + ex.getMessage()); }
 
+          affected.add(jvId);
+          affected.addAll(conflicts.values());   // donors that just lost a transponder
           saved[0] = true; sh.close();
         }
         catch (Exception ex)
@@ -325,7 +337,7 @@ public final class AssignmentEditDialog
     sh.pack(); sh.open();
     Display d = sh.getDisplay();
     while (!sh.isDisposed()) { if (!d.readAndDispatch()) d.sleep(); }
-    return saved[0];
+    return saved[0] ? affected : null;
   }
 
   /** Lookup display names for the given jverein IDs. */

@@ -15,6 +15,7 @@ import org.eclipse.swt.layout.GridData;
 import org.eclipse.swt.layout.GridLayout;
 import org.eclipse.swt.widgets.Button;
 import org.eclipse.swt.widgets.Composite;
+import org.eclipse.swt.widgets.Display;
 import org.eclipse.swt.widgets.FileDialog;
 import org.eclipse.swt.widgets.Label;
 import org.eclipse.swt.widgets.MessageBox;
@@ -23,8 +24,12 @@ import org.eclipse.swt.widgets.TableColumn;
 import org.eclipse.swt.widgets.TableItem;
 import org.eclipse.swt.widgets.Text;
 
+import org.json.JSONArray;
+import org.json.JSONObject;
+
 import de.jost_net.JVerein.Einstellungen;
 import de.jost_net.JVerein.hikvision.ChipStore;
+import de.jost_net.JVerein.hikvision.HikvisionClient;
 import de.jost_net.JVerein.hikvision.MitgliedAssignments;
 import de.jost_net.JVerein.hikvision.PlanCache;
 import de.jost_net.JVerein.hikvision.SyncEngine;
@@ -50,7 +55,11 @@ public class HikvisionChipsView extends AbstractView
   private Set<String> chipFilter;   // null = no filter; set = restrict rows to these chip ids
   private Label filterStatus;
   private Button clearFilterBtn;
+  private Button loadCardsBtn;
   private Text searchField;          // live full-text search across all 4 columns
+  /** Cards found on the controller (last "Karten aus Hikvision laden") that
+   *  have no Transponder mapping yet. Each entry = { cardNo, employeeNo }. */
+  private List<String[]> unknownCards = new ArrayList<>();
 
   @Override
   public void bind() throws Exception
@@ -81,7 +90,9 @@ public class HikvisionChipsView extends AbstractView
 
     Label info = new Label(c, SWT.WRAP);
     info.setText("Transponder ↔ Kartennummer + aktuelle Zuweisung (jverein-Seite aus "
-        + "MitgliedAssignments, Hikvision-Seite aus dem letzten Aktualisierungslauf).");
+        + "MitgliedAssignments, Hikvision-Seite aus dem letzten Aktualisierungslauf). "
+        + "'Karten aus Hikvision laden' zeigt zusätzlich Karten, die am Controller registriert sind, "
+        + "aber noch keine Transponder-Nummer haben — Doppelklick zum Zuordnen.");
     GridData infoGd = new GridData(SWT.FILL, SWT.CENTER, true, false, 2, 1);
     infoGd.widthHint = 600;
     info.setLayoutData(infoGd);
@@ -125,12 +136,20 @@ public class HikvisionChipsView extends AbstractView
 
     Composite btnRow = new Composite(c, SWT.NONE);
     btnRow.setLayoutData(new GridData(SWT.FILL, SWT.CENTER, true, false, 2, 1));
-    btnRow.setLayout(new GridLayout(5, false));
+    btnRow.setLayout(new GridLayout(6, false));
     mk(btnRow, "Hinzufügen…",            () -> onAdd());
     mk(btnRow, "Bearbeiten…",            () -> onEdit());
     mk(btnRow, "Löschen",                 () -> onDelete());
     mk(btnRow, "Aus CSV importieren…",   () -> onImport());
     mk(btnRow, "Als CSV exportieren…",   () -> onExport());
+    loadCardsBtn = new Button(btnRow, SWT.PUSH);
+    loadCardsBtn.setText("Karten aus Hikvision laden…");
+    loadCardsBtn.setToolTipText("Liest alle Karten vom Controller und zeigt jene ohne "
+        + "Transponder-Nummer an, damit du sie zuordnen kannst.");
+    loadCardsBtn.setLayoutData(new GridData(SWT.FILL, SWT.CENTER, true, false));
+    loadCardsBtn.addSelectionListener(new SelectionAdapter() {
+      @Override public void widgetSelected(SelectionEvent e) { onLoadCardsFromHikvision(); }
+    });
   }
 
   @FunctionalInterface private interface OnClick { void onClick(); }
@@ -171,6 +190,31 @@ public class HikvisionChipsView extends AbstractView
       ti.setText(1, cardNo);
       ti.setText(2, jv == null ? "" : jv);
       ti.setText(3, hk == null ? "" : hk);
+    }
+
+    // Controller cards without a Transponder mapping (from "Karten aus Hikvision
+    // laden") — appended with an empty Transponder column, ready to be assigned.
+    // Skipped while a chip-id filter is active (they have no chip to match).
+    if (chipFilter == null)
+    {
+      for (String[] uc : unknownCards)
+      {
+        String cardNo = uc[0], emp = uc[1];
+        if (store.chipForCard(cardNo) != null) continue;   // mapped meanwhile
+        String hk = hikByCard.get(cardNo);
+        if (hk == null || hk.isEmpty()) hk = emp.isEmpty() ? "" : ("(employeeNo " + emp + ")");
+        if (!q.isEmpty())
+        {
+          String haystack = (cardNo + " " + hk).toLowerCase();
+          if (!haystack.contains(q)) continue;
+        }
+        TableItem ti = new TableItem(table, SWT.NONE);
+        ti.setText(0, "— neu —");
+        ti.setText(1, cardNo);
+        ti.setText(2, "");
+        ti.setText(3, hk);
+        ti.setData("newCard", cardNo);
+      }
     }
     TableSorter.reapplyIfSorted(table);
   }
@@ -256,6 +300,22 @@ public class HikvisionChipsView extends AbstractView
   {
     int idx = table.getSelectionIndex(); if (idx < 0) return;
     TableItem ti = table.getItem(idx);
+    Object newCard = ti.getData("newCard");
+    if (newCard != null)
+    {
+      // An as-yet-unmapped controller card — assign it a Transponder number.
+      String cardNo = newCard.toString();
+      String[] vals = ChipEditDialog.open(GUI.getShell(), "Transponder zuordnen", "", cardNo);
+      if (vals == null) return;
+      try
+      {
+        store.put(vals[0], vals[1]); store.save();
+        removeFromUnknown(cardNo); removeFromUnknown(vals[1]);
+        refresh();
+      }
+      catch (Exception e) { err("Zuordnen fehlgeschlagen", e.getMessage()); }
+      return;
+    }
     String oldChip = ti.getText(0), oldCard = ti.getText(1);
     String[] vals = ChipEditDialog.open(GUI.getShell(), "Transponder bearbeiten", oldChip, oldCard);
     if (vals == null) return;
@@ -267,10 +327,70 @@ public class HikvisionChipsView extends AbstractView
     catch (Exception e) { err("Bearbeiten fehlgeschlagen", e.getMessage()); }
   }
 
+  /** Drop any pending unknown-card entry for this card number. */
+  private void removeFromUnknown(String cardNo)
+  {
+    if (cardNo == null) return;
+    unknownCards.removeIf(uc -> cardNo.equals(uc[0]));
+  }
+
+  /**
+   * Fetch every card from the controller and surface the ones with no
+   * Transponder (ChipStore) mapping yet, so they can be assigned a number.
+   * Runs on a daemon thread (the call deadline bounds a wedged request); the
+   * results are merged into the table on the UI thread.
+   */
+  private void onLoadCardsFromHikvision()
+  {
+    if (loadCardsBtn != null && !loadCardsBtn.isDisposed()) loadCardsBtn.setEnabled(false);
+    Thread t = new Thread(() -> {
+      try
+      {
+        HikvisionClient client = HikvisionGruppenView.newClient();
+        JSONArray cards = client.listAllCards(HikvisionGruppenView.logOnly());
+        List<String[]> unknown = new ArrayList<>();
+        for (int i = 0; i < cards.length(); i++)
+        {
+          JSONObject co = cards.getJSONObject(i);
+          String cardNo = co.optString("cardNo", "");
+          if (cardNo.isEmpty() || store.chipForCard(cardNo) != null) continue;
+          unknown.add(new String[] { cardNo, co.optString("employeeNo", "") });
+        }
+        final int total = cards.length();
+        Display.getDefault().asyncExec(() -> {
+          unknownCards = unknown;
+          refresh();
+          if (loadCardsBtn != null && !loadCardsBtn.isDisposed()) loadCardsBtn.setEnabled(true);
+          info("Karten geladen", total + " Karten am Controller, davon " + unknown.size()
+              + " ohne Transponder-Nummer.\n\nDiese erscheinen unten mit leerer Transponder-Spalte "
+              + "(\"— neu —\") — Doppelklick zum Zuordnen.");
+        });
+      }
+      catch (Exception e)
+      {
+        Logger.error("Karten aus Hikvision laden fehlgeschlagen", e);
+        Display.getDefault().asyncExec(() -> {
+          if (loadCardsBtn != null && !loadCardsBtn.isDisposed()) loadCardsBtn.setEnabled(true);
+          err("Karten laden fehlgeschlagen", e.getClass().getSimpleName() + ": " + e.getMessage());
+        });
+      }
+    }, "jverein.hikvision-chips-loadcards");
+    t.setDaemon(true); t.start();
+  }
+
   private void onDelete()
   {
     int idx = table.getSelectionIndex(); if (idx < 0) return;
-    String chip = table.getItem(idx).getText(0);
+    TableItem sel = table.getItem(idx);
+    Object newCard = sel.getData("newCard");
+    if (newCard != null)
+    {
+      // Not a stored mapping — just dismiss the controller-card suggestion.
+      removeFromUnknown(newCard.toString());
+      refresh();
+      return;
+    }
+    String chip = sel.getText(0);
     if (!confirm("Löschen", "Transponder-Eintrag '" + chip + "' wirklich löschen?")) return;
     try { store.removeByChip(chip); store.save(); refresh(); }
     catch (Exception e) { err("Löschen fehlgeschlagen", e.getMessage()); }
