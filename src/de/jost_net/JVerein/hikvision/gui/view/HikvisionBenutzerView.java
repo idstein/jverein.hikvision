@@ -29,6 +29,7 @@ import de.jost_net.JVerein.hikvision.Identity;
 import de.jost_net.JVerein.hikvision.MitgliedAssignments;
 import de.jost_net.JVerein.hikvision.PlanCache;
 import de.jost_net.JVerein.hikvision.SyncEngine;
+import de.jost_net.JVerein.hikvision.SyncOrchestrator;
 import de.jost_net.JVerein.hikvision.ext.AssignmentEditDialog;
 import de.jost_net.JVerein.hikvision.ext.HikvisionBackgroundTask;
 import de.jost_net.JVerein.hikvision.ext.MitgliedPickerDialog;
@@ -632,6 +633,7 @@ public class HikvisionBenutzerView extends AbstractView
         HikvisionSettings.getVerifySsl());
     if (task != null) client.setCancelCheck(task::isInterrupted);
     client.setResilience(HikvisionSettings.getMaxAttempts(), HikvisionSettings.getCallDeadlineMs());
+    client.setUseSession(HikvisionSettings.getUseSessionAuth());
     return client;
   }
 
@@ -654,58 +656,18 @@ public class HikvisionBenutzerView extends AbstractView
     });
   }
 
-  /** Returns a human-readable reason to escalate, or null if incremental is OK. */
+  // Escalation / scope / actionable-count logic lives in SyncOrchestrator now
+  // (shared with the unattended scheduler) — these delegate so there is a
+  // single implementation.
   private String decideEscalation(MitgliedAssignments asn, PlanCache.Cached cached, HikvisionClient client)
       throws java.io.IOException
-  {
-    if (cached == null || cached.plan == null) return "kein Cache";
-    if (asn.getLastFullRefresh() <= 0)         return "noch nie vollständig aktualisiert";
-    long ageMs = System.currentTimeMillis() - asn.getLastFullRefresh();
-    if (ageMs > 7L * 24 * 3600 * 1000)         return "letzte volle Aktualisierung > 7 Tage her";
+  { return SyncOrchestrator.decideEscalation(asn, cached, client); }
 
-    int curUsers = client.getTotalUsers();
-    int curCards = client.getTotalCards();
-    int knownUsers = asn.getLastFullUserTotal();
-    int knownCards = asn.getLastFullCardTotal();
-    if (knownUsers != curUsers || knownCards != curCards)
-      return "Hikvision Gesamtzahl abweichend (Benutzer " + knownUsers + "→" + curUsers
-          + ", Karten " + knownCards + "→" + curCards + ")";
-    return null;
-  }
-
-  /** Scope = (cached non-OK/non-HIK_ONLY rows) ∪ (assignments modified
-   *  since lastFullRefresh) ∪ (assignments whose employeeNo isn't in the
-   *  cached plan yet — could be new CREATE). */
   private java.util.Set<String> buildIncrementalScope(MitgliedAssignments asn, SyncEngine.Plan cached)
-  {
-    java.util.Set<String> cachedEmp = new java.util.HashSet<>();
-    java.util.Set<String> scope = new java.util.HashSet<>();
-    for (SyncEngine.PlanRow r : cached.rows)
-    {
-      String canon = Identity.canonical(r.employeeNo);
-      cachedEmp.add(canon);
-      if (r.status != null && r.status != SyncEngine.Status.OK
-          && r.status != SyncEngine.Status.HIK_ONLY)
-        scope.add(canon);
-    }
-    long fullAt = asn.getLastFullRefresh();
-    for (MitgliedAssignments.Assignment a : asn.all())
-    {
-      if (a.employeeNo == null || a.employeeNo.isEmpty()) continue;
-      String canon = Identity.canonical(a.employeeNo);
-      if (a.modifiedAt > fullAt || !cachedEmp.contains(canon)) scope.add(canon);
-    }
-    return scope;
-  }
+  { return SyncOrchestrator.buildIncrementalScope(asn, cached); }
 
   private int countActionableInCache(SyncEngine.Plan p)
-  {
-    int n = 0;
-    for (SyncEngine.PlanRow r : p.rows)
-      if (r.status != null && r.status != SyncEngine.Status.OK
-          && r.status != SyncEngine.Status.HIK_ONLY) n++;
-    return n;
-  }
+  { return SyncOrchestrator.countActionableInCache(p); }
 
   /** Snapshot the employeeNos currently visible in the table (after the
    *  user's filter+search). Reads from the live SWT widgets — must be
@@ -917,15 +879,30 @@ public class HikvisionBenutzerView extends AbstractView
 
   private void startTask(String name, boolean dryRun, Body body)
   {
-    setActionsEnabled(false);
-    log("");
-    log(name + " gestartet (" + (dryRun ? "Trockenlauf" : "APPLY") + ") …\n");
     if (progress != null && !progress.isDisposed()) { progress.setMaximum(100); progress.setSelection(0); }
     Application.getController().start(new HikvisionBackgroundTask() {
       @Override public void run(ProgressMonitor mon) throws ApplicationException
       {
+        // Acquire the shared guard HERE (inside the task that actually runs),
+        // not before submitting — if Jameica's single slot silently drops this
+        // submission the flag is never set, so it can't leak. Loss means a
+        // scheduled tick is mid-run: tell the user, don't no-op silently.
+        boolean acquired = SyncOrchestrator.SYNC_IN_PROGRESS.compareAndSet(false, true);
         try
         {
+          if (!acquired)
+          {
+            log("\nHikvision-Sync läuft bereits (evtl. geplanter Lauf) — bitte kurz warten.\n");
+            mon.setStatusText("Sync läuft bereits");
+            mon.setStatus(ProgressMonitor.STATUS_CANCEL);
+            return;
+          }
+          // Disable actions only now that the task is actually running — if
+          // Jameica silently dropped this submission, run() never executes and
+          // the buttons must stay enabled (else they'd be stuck disabled).
+          Display.getDefault().asyncExec(() -> setActionsEnabled(false));
+          log("");
+          log(name + " gestartet (" + (dryRun ? "Trockenlauf" : "APPLY") + ") …\n");
           mon.setStatusText(name + " läuft …");
           HikvisionSettings.SETTINGS.toString();  // ensure plugin Settings class is loaded
           body.run(this, mon);
@@ -949,7 +926,11 @@ public class HikvisionBenutzerView extends AbstractView
         }
         finally
         {
-          Display.getDefault().asyncExec(() -> setActionsEnabled(true));
+          if (acquired)
+          {
+            SyncOrchestrator.SYNC_IN_PROGRESS.set(false);
+            Display.getDefault().asyncExec(() -> setActionsEnabled(true));
+          }
         }
       }
     });

@@ -100,6 +100,40 @@ public class HikvisionSettings
   }
   public static void setCallDeadlineMs(int n) { SETTINGS.setAttribute("controller.callDeadlineMs", Math.max(1000, n)); }
 
+  // -- auth --
+  /** Use the ISAPI session token (one login, then cookie-authed calls) instead
+   *  of a per-call HTTP Digest 401 challenge. Falls back to digest automatically
+   *  if the controller doesn't support it. Validated on DS-K2702WX fw V1.7.4. */
+  public static boolean getUseSessionAuth() { return SETTINGS.getBoolean("controller.useSessionAuth", true); }
+  public static void setUseSessionAuth(boolean b) { SETTINGS.setAttribute("controller.useSessionAuth", b); }
+
+  // -- scheduled delta sync --
+  /** Master switch for the unattended periodic delta sync. Default off. */
+  public static boolean getSyncScheduleEnabled() { return SETTINGS.getBoolean("sync.schedule.enabled", false); }
+  public static void setSyncScheduleEnabled(boolean b) { SETTINGS.setAttribute("sync.schedule.enabled", b); }
+
+  /** Cheap incremental tick interval in minutes, clamped to 60–240 (1–4 h). */
+  public static int getSyncIntervalMinutes() { return clamp(SETTINGS.getInt("sync.schedule.intervalMinutes", 120), 60, 240); }
+  public static void setSyncIntervalMinutes(int n) { SETTINGS.setAttribute("sync.schedule.intervalMinutes", clamp(n, 60, 240)); }
+
+  /** Forced full-reconcile cadence in minutes — backstop for same-count
+   *  out-of-band controller edits. Default nightly (1440), min 240. */
+  public static int getForcedFullIntervalMinutes() { return Math.max(240, SETTINGS.getInt("sync.schedule.forcedFullMinutes", 1440)); }
+  public static void setForcedFullIntervalMinutes(int n) { SETTINGS.setAttribute("sync.schedule.forcedFullMinutes", Math.max(240, n)); }
+
+  /** When true a scheduled tick also WRITES (applies) the diff; when false it
+   *  only refreshes the cached plan (no controller writes). Separate from the
+   *  interactive {@link #getDryRun}. Default false until trusted. */
+  public static boolean getAutoApply() { return SETTINGS.getBoolean("sync.schedule.autoApply", false); }
+  public static void setAutoApply(boolean b) { SETTINGS.setAttribute("sync.schedule.autoApply", b); }
+
+  /** When false (default), an auto-apply tick withholds DELETE (orphan-removal)
+   *  — the highest-blast-radius write — leaving it for a reviewed manual sync. */
+  public static boolean getAutoApplyDeletes() { return SETTINGS.getBoolean("sync.schedule.autoApplyDeletes", false); }
+  public static void setAutoApplyDeletes(boolean b) { SETTINGS.setAttribute("sync.schedule.autoApplyDeletes", b); }
+
+  private static int clamp(int v, int lo, int hi) { return Math.max(lo, Math.min(hi, v)); }
+
   // -- safety --
   public static boolean getDryRun()
   {

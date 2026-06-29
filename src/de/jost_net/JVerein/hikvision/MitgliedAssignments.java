@@ -85,6 +85,12 @@ public class MitgliedAssignments
   private int lastFullUserTotal = -1;
   private int lastFullCardTotal = -1;
 
+  /** Per-member desired-state fingerprints from the last clean scheduled tick:
+   *  jvId → {hash, lastKnownEmployeeNo}. Lets the scheduler detect source-side
+   *  deltas (austritt, name, externe/identity, transponder, group) made even
+   *  OUTSIDE the plugin UI — which {@link Assignment#modifiedAt} misses. */
+  private final LinkedHashMap<String, String[]> memberFingerprints = new LinkedHashMap<>();
+
   private MitgliedAssignments(File backing) { this.backing = backing; }
 
   public static File defaultFile()
@@ -201,6 +207,25 @@ public class MitgliedAssignments
     saveMeta();
   }
 
+  /** jvId → {hash, employeeNo} from the last clean scheduled tick (copy). */
+  public synchronized Map<String, String[]> getMemberFingerprints()
+  {
+    Map<String, String[]> copy = new HashMap<>();
+    for (Map.Entry<String, String[]> e : memberFingerprints.entrySet())
+      copy.put(e.getKey(), e.getValue() == null ? null : e.getValue().clone());
+    return copy;
+  }
+
+  /** Replace + persist the member fingerprints (called after a clean tick). */
+  public synchronized void recordMemberFingerprints(Map<String, String[]> fps) throws IOException
+  {
+    memberFingerprints.clear();
+    if (fps != null) for (Map.Entry<String, String[]> e : fps.entrySet())
+      if (e.getKey() != null && e.getValue() != null && e.getValue().length >= 2)
+        memberFingerprints.put(e.getKey(), new String[] { e.getValue()[0], e.getValue()[1] });
+    saveMeta();
+  }
+
   private synchronized void loadMeta()
   {
     File mf = metaFileFor(backing);
@@ -213,6 +238,16 @@ public class MitgliedAssignments
       lastFullRefresh   = o.optLong("lastFullRefresh", 0L);
       lastFullUserTotal = o.optInt("lastFullUserTotal", -1);
       lastFullCardTotal = o.optInt("lastFullCardTotal", -1);
+      memberFingerprints.clear();
+      JSONArray fps = o.optJSONArray("memberFingerprints");
+      if (fps != null) for (int i = 0; i < fps.length(); i++)
+      {
+        JSONObject f = fps.getJSONObject(i);
+        String jvId = f.optString("jvId", "");
+        String hash = f.optString("hash", "");
+        if (jvId.isEmpty() || hash.isEmpty()) continue;
+        memberFingerprints.put(jvId, new String[] { hash, f.optString("employeeNo", "") });
+      }
     }
     catch (Exception e)
     { Logger.warn("MitgliedAssignments.meta.json unlesbar — verworfen: " + e.getMessage()); }
@@ -224,6 +259,12 @@ public class MitgliedAssignments
     o.put("lastFullRefresh", lastFullRefresh);
     o.put("lastFullUserTotal", lastFullUserTotal);
     o.put("lastFullCardTotal", lastFullCardTotal);
+    JSONArray fps = new JSONArray();
+    for (Map.Entry<String, String[]> e : memberFingerprints.entrySet())
+      fps.put(new JSONObject().put("jvId", e.getKey())
+                              .put("hash", e.getValue()[0])
+                              .put("employeeNo", e.getValue().length > 1 ? e.getValue()[1] : ""));
+    o.put("memberFingerprints", fps);
     File mf = metaFileFor(backing);
     if (mf.getParentFile() != null) mf.getParentFile().mkdirs();
     File tmp = new File(mf.getParentFile(), mf.getName() + ".tmp");

@@ -134,6 +134,7 @@ public class HikvisionGruppenView extends AbstractView
         HikvisionSettings.getControllerPassword(), HikvisionSettings.getInterCallPauseMs(),
         HikvisionSettings.getVerifySsl());
     client.setResilience(HikvisionSettings.getMaxAttempts(), HikvisionSettings.getCallDeadlineMs());
+    client.setUseSession(HikvisionSettings.getUseSessionAuth());
     return client;
   }
 

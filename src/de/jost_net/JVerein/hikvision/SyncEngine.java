@@ -1022,7 +1022,7 @@ public class SyncEngine
     HikvisionClient client = buildClient(pl);
     ChipStore chips = ChipStore.defaultStore();
     Plan plan = computePlan(chips, client, pl);
-    return applyPlan(plan, dryRun, client, pl);
+    return applyPlan(plan, dryRun, true, client, pl);
   }
 
   /** Apply an already-computed plan (the cached Benutzer-view diff) WITHOUT any
@@ -1033,14 +1033,24 @@ public class SyncEngine
   public static Result applyCached(Plan plan, boolean dryRun,
                                    de.jost_net.JVerein.hikvision.ProgressListener pl) throws Exception
   {
-    pl.log("=== Sync " + (dryRun ? "(DRY-RUN)" : "(APPLY)") + " (nur offene Aktionen) ===");
+    return applyCached(plan, dryRun, true, pl);
+  }
+
+  /** As {@link #applyCached(Plan, boolean, de.jost_net.JVerein.hikvision.ProgressListener)},
+   *  but {@code allowDelete=false} withholds DELETE (orphan removal) — used by
+   *  the unattended scheduler so it never auto-deletes a controller record. */
+  public static Result applyCached(Plan plan, boolean dryRun, boolean allowDelete,
+                                   de.jost_net.JVerein.hikvision.ProgressListener pl) throws Exception
+  {
+    pl.log("=== Sync " + (dryRun ? "(DRY-RUN)" : "(APPLY)") + " (nur offene Aktionen"
+        + (allowDelete ? "" : ", ohne Löschen") + ") ===");
     if (plan == null)
     {
       Result r = new Result(); r.dryRun = dryRun;
       pl.log("Kein Plan im Cache — bitte zuerst 'Aktualisieren' klicken.");
       return r;
     }
-    return applyPlan(plan, dryRun, buildClient(pl), pl);
+    return applyPlan(plan, dryRun, allowDelete, buildClient(pl), pl);
   }
 
   /** Controller client wired to the task's cancel flag + configured
@@ -1053,13 +1063,14 @@ public class SyncEngine
         HikvisionSettings.getVerifySsl());
     client.setCancelCheck(pl::isCancelled);
     client.setResilience(HikvisionSettings.getMaxAttempts(), HikvisionSettings.getCallDeadlineMs());
+    client.setUseSession(HikvisionSettings.getUseSessionAuth());
     return client;
   }
 
   /** Walk the plan and write only the actionable rows (OK / HIK_ONLY /
    *  INCOMPLETE are no-ops). On full success folds the applied changes into the
    *  cache (no re-fetch); on partial failure invalidates it. */
-  private static Result applyPlan(Plan plan, boolean dryRun, HikvisionClient client,
+  private static Result applyPlan(Plan plan, boolean dryRun, boolean allowDelete, HikvisionClient client,
                                   de.jost_net.JVerein.hikvision.ProgressListener pl) throws Exception
   {
     Result r = new Result();
@@ -1089,7 +1100,7 @@ public class SyncEngine
           applyCardRemovals(client, row, dryRun, r, pl);
           break;
         case DELETE:
-          applyDelete(client, row, dryRun, r, pl);   // removes its cards + the user
+          if (allowDelete) applyDelete(client, row, dryRun, r, pl);   // removes its cards + the user
           break;
         default:
           break;
@@ -1145,7 +1156,7 @@ public class SyncEngine
         // Apply succeeded fully — fold the applied changes into the plan so the
         // cached Benutzer view reflects the new controller state immediately and
         // survives a restart, WITHOUT a follow-up full re-fetch.
-        foldAppliedIntoCache(plan);
+        foldAppliedIntoCache(plan, allowDelete);
       else
         // Partial failure — real controller state is uncertain, so drop the
         // cache and let the next view-open / refresh re-fetch authoritatively.
@@ -1159,7 +1170,7 @@ public class SyncEngine
    *  DELETE rows, recompute the access-ended flag + counters, and persist. No
    *  controller round-trip — this is the cheap alternative to invalidating the
    *  cache and forcing a manual Aktualisieren after every sync. */
-  private static void foldAppliedIntoCache(Plan plan)
+  private static void foldAppliedIntoCache(Plan plan, boolean allowDelete)
   {
     java.util.Iterator<PlanRow> it = plan.rows.iterator();
     while (it.hasNext())
@@ -1169,7 +1180,8 @@ public class SyncEngine
       switch (r.status)
       {
         case DELETE:
-          it.remove();                 // user removed from the controller
+          if (allowDelete) it.remove();   // user removed from the controller
+          // else: DELETE was withheld (scheduler) — keep the row actionable
           break;
         case CREATE:
         case UPDATE:

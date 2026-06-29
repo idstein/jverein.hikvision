@@ -69,6 +69,12 @@ public class SettingsView implements Extension
   private IntegerInput interCallPauseMs;
   private IntegerInput maxAttempts;
   private IntegerInput callDeadlineMs;
+  private CheckboxInput useSessionAuth;
+  private CheckboxInput scheduleEnabled;
+  private IntegerInput syncIntervalMinutes;
+  private IntegerInput forcedFullMinutes;
+  private CheckboxInput autoApply;
+  private CheckboxInput autoApplyDeletes;
   private LabelInput statusLabel;
   private Button testBtn;
   private Button fetchBtn;
@@ -156,6 +162,23 @@ public class SettingsView implements Extension
     tab.addLabelPair("Pause zwischen Calls (ms)", interCallPauseMs);
     tab.addLabelPair("Versuche pro Call (1 = ohne Wiederholung)", maxAttempts);
     tab.addLabelPair("Max. Dauer pro Call (ms, danach Timeout + Wiederholung)", callDeadlineMs);
+
+    // --- Authentifizierung ---
+    useSessionAuth = new CheckboxInput(HikvisionSettings.getUseSessionAuth());
+    tab.addCheckbox(useSessionAuth,
+        "Session-Token verwenden (ein Login, dann Cookie — statt Digest-401 pro Aufruf; Fallback automatisch)");
+
+    // --- Geplanter Delta-Sync (unbeaufsichtigt) ---
+    scheduleEnabled = new CheckboxInput(HikvisionSettings.getSyncScheduleEnabled());
+    syncIntervalMinutes = new IntegerInput(HikvisionSettings.getSyncIntervalMinutes());
+    forcedFullMinutes = new IntegerInput(HikvisionSettings.getForcedFullIntervalMinutes());
+    autoApply = new CheckboxInput(HikvisionSettings.getAutoApply());
+    autoApplyDeletes = new CheckboxInput(HikvisionSettings.getAutoApplyDeletes());
+    tab.addCheckbox(scheduleEnabled, "Geplanten Delta-Sync aktivieren (wirkt nach Neustart)");
+    tab.addLabelPair("Sync-Intervall (Minuten, 60–240)", syncIntervalMinutes);
+    tab.addLabelPair("Voll-Abgleich-Intervall (Minuten, ≥ 240)", forcedFullMinutes);
+    tab.addCheckbox(autoApply, "Beim geplanten Sync automatisch übertragen (sonst nur prüfen/anzeigen)");
+    tab.addCheckbox(autoApplyDeletes, "Dabei auch Löschungen automatisch übertragen (riskant — Standard: aus)");
 
     Composite btnRow = new Composite(tab.getComposite(), SWT.NONE);
     btnRow.setLayoutData(new GridData(SWT.FILL, SWT.CENTER, true, false, 2, 1));
@@ -353,6 +376,7 @@ public class SettingsView implements Extension
     if (attempts instanceof Integer) HikvisionSettings.setMaxAttempts((Integer) attempts);
     Object deadline = callDeadlineMs.getValue();
     if (deadline instanceof Integer) HikvisionSettings.setCallDeadlineMs((Integer) deadline);
+    if (useSessionAuth != null) HikvisionSettings.setUseSessionAuth(Boolean.TRUE.equals(useSessionAuth.getValue()));
   }
 
   private HikvisionClient currentClient()
@@ -366,6 +390,7 @@ public class SettingsView implements Extension
     // No cancel button here, but the configured deadline still bounds a
     // wedged test/fetch call so it can't hang indefinitely.
     client.setResilience(HikvisionSettings.getMaxAttempts(), HikvisionSettings.getCallDeadlineMs());
+    client.setUseSession(HikvisionSettings.getUseSessionAuth());
     return client;
   }
 
@@ -418,6 +443,14 @@ public class SettingsView implements Extension
       }
 
       HikvisionSettings.setZusatzfeldName((String) zusatzfeldName.getValue());
+
+      if (scheduleEnabled != null) HikvisionSettings.setSyncScheduleEnabled(Boolean.TRUE.equals(scheduleEnabled.getValue()));
+      Object iv = syncIntervalMinutes == null ? null : syncIntervalMinutes.getValue();
+      if (iv instanceof Integer) HikvisionSettings.setSyncIntervalMinutes((Integer) iv);
+      Object ff = forcedFullMinutes == null ? null : forcedFullMinutes.getValue();
+      if (ff instanceof Integer) HikvisionSettings.setForcedFullIntervalMinutes((Integer) ff);
+      if (autoApply != null) HikvisionSettings.setAutoApply(Boolean.TRUE.equals(autoApply.getValue()));
+      if (autoApplyDeletes != null) HikvisionSettings.setAutoApplyDeletes(Boolean.TRUE.equals(autoApplyDeletes.getValue()));
     }
     catch (Exception e) { throw new ApplicationException(e.getMessage(), e); }
   }

@@ -64,6 +64,16 @@ public class HikvisionClient
   private final int pauseMs;
   private final HttpClient http;
 
+  // -- session-token auth (ISAPI Security/sessionLogin) --
+  // Preferred over per-call digest: one login (cap + login = 2 round-trips,
+  // no 401), then every call is a single round-trip carrying the WebSession
+  // cookie. Validated on DS-K2702WX fw V1.7.4. Auto-detects + falls back to
+  // digest if the device doesn't support it.
+  private volatile boolean useSession = true;
+  private volatile boolean sessionUnavailable = false;   // login proven unsupported/failed → digest only
+  private volatile String  sessionCookie = null;         // "WebSession_xxx=...." from login
+  private final Object sessionLock = new Object();
+
   public HikvisionClient(String baseUrl, String user, String password, int pauseMs)
   {
     this(baseUrl, user, password, pauseMs, false);
@@ -146,6 +156,10 @@ public class HikvisionClient
     this.callDeadlineMs = Math.max(1000L, callDeadlineMs);
   }
 
+  /** Enable/disable the session-token auth path. When false (or after a failed
+   *  login), every call uses per-call HTTP Digest instead. */
+  public void setUseSession(boolean b) { this.useSession = b; }
+
   /** One logical round-trip with fresh digest, retried on transient 401 /
    *  connection failures. Throws on a genuine non-2xx (other than a retried
    *  401) or after all attempts are exhausted. */
@@ -155,8 +169,58 @@ public class HikvisionClient
     IOException last = null;
     for (int attempt = 1; attempt <= maxAttempts; attempt++)
     {
+      // ---- Session-token path (preferred): one round-trip per call after a
+      //      one-time login, no per-call 401 digest challenge. Lazily logs in;
+      //      on a 401 the session is dropped and re-established next attempt;
+      //      if login is unsupported/fails the client falls back to digest. ----
+      if (useSession && !sessionUnavailable)
+      {
+        boolean hadCookie = sessionCookie != null;   // reused cached cookie vs a fresh login this attempt
+        String cookie;
+        try { cookie = ensureSessionCookie(); }
+        catch (InterruptedIOException ie) { throw ie; }
+        catch (IOException e)
+        {
+          Logger.warn("Hikvision Session-Login fehlgeschlagen — fallback auf Digest: " + e.getMessage());
+          sessionUnavailable = true; cookie = null;
+        }
+        if (cookie != null)
+        {
+          HttpResponse<String> rs;
+          try { rs = send(method, url, body, null, cookie, "application/json"); }
+          catch (InterruptedIOException ie) { throw ie; }
+          catch (IOException e) { last = e; if (!backoff(attempt, method, path, e)) throw e; continue; }
+          int sc = rs.statusCode();
+          if (sc >= 200 && sc < 300) return rs.body();
+          if (sc == 401)
+          {
+            invalidateSession();
+            if (hadCookie)
+            {
+              // A previously-cached session expired → re-login on the next attempt.
+              last = new IOException("HTTP 401 (Session abgelaufen) on " + method + " " + path);
+              if (!backoff(attempt, method, path, last)) throw last;
+              continue;
+            }
+            // A FRESHLY minted session (login returned 200) was rejected outright
+            // → the session mechanism is unusable here (short-lived/per-request
+            // token, a proxy stripping the Cookie, an instantly-invalidated
+            // session). Demote to digest permanently and fall through to the
+            // digest path in THIS attempt — never spin re-login → 401 forever.
+            sessionUnavailable = true;
+            Logger.warn("Hikvision: frische Session sofort mit HTTP 401 abgelehnt — Wechsel auf Digest.");
+          }
+          else
+          {
+            throw new IOException("HTTP " + sc + " on " + method + " " + path + ": " + rs.body());
+          }
+        }
+        // cookie == null, or session just demoted on a fresh-login 401 → fall through to digest
+      }
+
+      // ---- Digest path (fallback) ----
       HttpResponse<String> r1;
-      try { r1 = send(method, url, body, null); }
+      try { r1 = send(method, url, body, null, null, "application/json"); }
       catch (InterruptedIOException ie) { throw ie; }   // cancellation — never retry
       catch (IOException e) { last = e; if (!backoff(attempt, method, path, e)) throw e; continue; }
 
@@ -172,7 +236,7 @@ public class HikvisionClient
 
       String auth = buildDigestHeader(challenge, method, path);
       HttpResponse<String> r2;
-      try { r2 = send(method, url, body, auth); }
+      try { r2 = send(method, url, body, auth, null, "application/json"); }
       catch (InterruptedIOException ie) { throw ie; }
       catch (IOException e) { last = e; if (!backoff(attempt, method, path, e)) throw e; continue; }
 
@@ -219,15 +283,17 @@ public class HikvisionClient
     }
   }
 
-  private HttpResponse<String> send(String method, String url, String body, String authHeader) throws IOException
+  private HttpResponse<String> send(String method, String url, String body, String authHeader,
+                                    String cookieHeader, String contentType) throws IOException
   {
     HttpRequest.Builder b = HttpRequest.newBuilder(URI.create(url))
         .timeout(Duration.ofSeconds(20));
     HttpRequest.BodyPublisher bp = body == null
         ? HttpRequest.BodyPublishers.noBody()
         : HttpRequest.BodyPublishers.ofString(body, StandardCharsets.UTF_8);
-    if (body != null) b.header("Content-Type", "application/json");
+    if (body != null) b.header("Content-Type", contentType == null ? "application/json" : contentType);
     if (authHeader != null) b.header("Authorization", authHeader);
+    if (cookieHeader != null) b.header("Cookie", cookieHeader);
     switch (method)
     {
       case "GET":    b.GET();        break;
@@ -275,6 +341,127 @@ public class HikvisionClient
       if (c instanceof IOException)             throw (IOException) c;
       throw new IOException(c == null ? ee.toString() : c.toString(), c);
     }
+  }
+
+  // ---------------------------------------------------- Session-token auth
+
+  private String ensureSessionCookie() throws IOException
+  {
+    String c = sessionCookie;
+    if (c != null) return c;
+    synchronized (sessionLock)
+    {
+      if (sessionCookie != null) return sessionCookie;
+      sessionCookie = doSessionLogin();
+      return sessionCookie;
+    }
+  }
+
+  private void invalidateSession() { synchronized (sessionLock) { sessionCookie = null; } }
+
+  /** Establish an ISAPI session token (validated on DS-K2702WX fw V1.7.4):
+   *  GET sessionLogin/capabilities (pre-auth) → compute the irreversible
+   *  password hash → POST sessionLogin (pre-auth) → capture the WebSession
+   *  cookie. Throws when the device doesn't support session login or rejects
+   *  the credentials (the caller then falls back to digest). */
+  private String doSessionLogin() throws IOException
+  {
+    HttpResponse<String> capRes = send("GET",
+        baseUrl + "/ISAPI/Security/sessionLogin/capabilities?username=" + urlEncode(user),
+        null, null, null, null);
+    if (capRes.statusCode() < 200 || capRes.statusCode() >= 300)
+      throw new IOException("sessionLogin/capabilities HTTP " + capRes.statusCode());
+    String cap = capRes.body();
+    String sessionID = xmlVal(cap, "sessionID");
+    String challenge = xmlVal(cap, "challenge");
+    String salt      = xmlVal(cap, "salt");
+    boolean irreversible = "true".equalsIgnoreCase(xmlVal(cap, "isIrreversible"));
+    String sidVer    = xmlVal(cap, "sessionIDVersion");
+    if (sessionID == null || challenge == null || salt == null)
+      throw new IOException("sessionLogin/capabilities: unerwartete Antwort");
+    if (!irreversible)
+      throw new IOException("sessionLogin: nicht-irreversibles Schema (nicht unterstützt)");
+    int iterations = 100;
+    try { iterations = Integer.parseInt(xmlVal(cap, "iterations").trim()); } catch (Exception ignored) {}
+
+    String encoded = encodeIrreversible(salt, challenge, iterations);
+    String reqBody = "<SessionLogin><userName>" + xmlEsc(user) + "</userName>"
+        + "<password>" + encoded + "</password>"
+        + "<sessionID>" + sessionID + "</sessionID>"
+        + "<isSessionIDValidLongTerm>true</isSessionIDValidLongTerm>"
+        + "<sessionIDVersion>" + (sidVer == null || sidVer.isEmpty() ? "2" : sidVer) + "</sessionIDVersion>"
+        + "</SessionLogin>";
+    HttpResponse<String> loginRes = send("POST", baseUrl + "/ISAPI/Security/sessionLogin",
+        reqBody, null, null, "application/xml");
+    if (loginRes.statusCode() < 200 || loginRes.statusCode() >= 300)
+      throw new IOException("sessionLogin HTTP " + loginRes.statusCode() + ": " + loginRes.body());
+    String statusValue = xmlVal(loginRes.body(), "statusValue");
+    if (statusValue != null && !statusValue.equals("200"))
+      throw new IOException("sessionLogin abgelehnt (statusValue=" + statusValue + ")");
+    String cookie = firstWebSessionCookie(loginRes);
+    if (cookie == null)
+    {
+      String sid = xmlVal(loginRes.body(), "sessionID");
+      if (sid == null || sid.isEmpty()) throw new IOException("sessionLogin: kein Cookie/sessionID in Antwort");
+      cookie = "WebSession=" + sid;
+    }
+    Logger.info("Hikvision Session-Token etabliert (long-term).");
+    return cookie;
+  }
+
+  /** Irreversible session-login hash, validated against DS-K2702WX fw V1.7.4
+   *  (isIrreversible=true, sessionIDVersion=2): sha256(user+salt+pass) →
+   *  sha256(·+challenge) → then (iterations-2) more sha256 rounds. */
+  private String encodeIrreversible(String salt, String challenge, int iterations)
+  {
+    String r = sha256Hex(user + salt + password);
+    r = sha256Hex(r + challenge);
+    for (int i = 2; i < iterations; i++) r = sha256Hex(r);
+    return r;
+  }
+
+  /** First {@code WebSession*} cookie pair from the login response, or null.
+   *  Deliberately ignores any Cloudflare/proxy cookies (e.g. {@code __cf_bm}):
+   *  returning an arbitrary first cookie would be sent as the auth Cookie and
+   *  401 every call. When null, {@link #doSessionLogin} falls back to the body
+   *  {@code sessionID}, which is strictly more reliable than a foreign cookie. */
+  private static String firstWebSessionCookie(HttpResponse<String> res)
+  {
+    for (String sc : res.headers().allValues("Set-Cookie"))
+    {
+      if (sc == null || sc.isEmpty()) continue;
+      String pair = sc.split(";", 2)[0].trim();
+      if (pair.toLowerCase().startsWith("websession")) return pair;
+    }
+    return null;
+  }
+
+  private static String sha256Hex(String s)
+  {
+    try
+    {
+      byte[] d = MessageDigest.getInstance("SHA-256").digest(s.getBytes(StandardCharsets.UTF_8));
+      StringBuilder sb = new StringBuilder(64);
+      for (byte b : d) sb.append(String.format("%02x", b));
+      return sb.toString();
+    }
+    catch (Exception e) { throw new RuntimeException(e); }
+  }
+
+  private static String xmlVal(String xml, String tag)
+  {
+    if (xml == null) return null;
+    Matcher m = Pattern.compile("<" + tag + ">(.*?)</" + tag + ">", Pattern.DOTALL).matcher(xml);
+    return m.find() ? m.group(1).trim() : null;
+  }
+
+  private static String xmlEsc(String s)
+  { return s == null ? "" : s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"); }
+
+  private static String urlEncode(String s)
+  {
+    try { return java.net.URLEncoder.encode(s, StandardCharsets.UTF_8); }
+    catch (Exception e) { return s; }
   }
 
   // ---------------------------------------------------------- Digest auth
